@@ -1,0 +1,20 @@
+{
+  "name": "filesender",
+  "version": "1.0.0",
+  "description": "Peer-to-peer file sharing app using WebRTC",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "webrtc",
+    "p2p",
+    "file-sharing"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}
