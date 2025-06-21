@@ -359,46 +359,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function setupUIEvents() {
-        // Add tabs for mobile view
-        if (window.innerWidth <= 768) {
-            const fileListsEl = document.querySelector('.file-lists');
-            if (fileListsEl) {
-                const tabsContainer = document.createElement('div');
-                tabsContainer.className = 'tabs-container';
-                
-                const sendTab = document.createElement('div');
-                sendTab.className = 'tab active';
-                sendTab.textContent = 'Files to Send';
-                sendTab.dataset.target = 'files-to-send';
-                
-                const receiveTab = document.createElement('div');
-                receiveTab.className = 'tab';
-                receiveTab.textContent = 'Received Files';
-                receiveTab.dataset.target = 'received-files';
-                
-                tabsContainer.appendChild(sendTab);
-                tabsContainer.appendChild(receiveTab);
-                fileListsEl.insertBefore(tabsContainer, fileListsEl.firstChild);
-                
-                const firstContainer = document.querySelectorAll('.list-container')[0];
-                if (firstContainer) firstContainer.classList.add('active');
-                
-                document.querySelectorAll('.tab').forEach(tab => {
-                    tab.addEventListener('click', () => {
-                        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                        document.querySelectorAll('.list-container').forEach(l => l.classList.remove('active'));
-                        
-                        tab.classList.add('active');
-                        const targetId = tab.dataset.target;
-                        const container = document.querySelector(`.list-container:has(#${targetId})`);
-                        if (container) {
-                            container.classList.add('active');
-                        }
-                    });
-                });
-            }
-        }
-        
         // Copy button event
         if (copyButton && shareLinkInput) {
             copyButton.addEventListener('click', () => {
@@ -409,7 +369,6 @@ document.addEventListener('DOMContentLoaded', () => {
                         copyButton.textContent = 'Copy';
                     }, 2000);
                 }).catch(() => {
-                    // Fallback for older browsers
                     document.execCommand('copy');
                     copyButton.textContent = 'Copied!';
                     setTimeout(() => {
@@ -424,16 +383,16 @@ document.addEventListener('DOMContentLoaded', () => {
             dropZone.addEventListener('click', () => {
                 fileInput.click();
             });
-
+    
             dropZone.addEventListener('dragover', (e) => {
                 e.preventDefault();
                 dropZone.classList.add('dragover');
             });
-
+    
             dropZone.addEventListener('dragleave', () => {
                 dropZone.classList.remove('dragover');
             });
-
+    
             dropZone.addEventListener('drop', (e) => {
                 e.preventDefault();
                 dropZone.classList.remove('dragover');
@@ -442,15 +401,196 @@ document.addEventListener('DOMContentLoaded', () => {
                     handleFiles(e.dataTransfer.files);
                 }
             });
-
+    
             fileInput.addEventListener('change', (e) => {
                 if (e.target.files.length > 0) {
                     handleFiles(e.target.files);
                 }
             });
         }
+        
+        // Initialize tab system - CRITICAL FIX
+        initializeTabs();
+        
+        // Add empty state messages to file lists
+        addEmptyStateMessages();
+    }
+    
+    // NEW FUNCTION: Initialize tabs properly
+    function initializeTabs() {
+        const tabs = document.querySelectorAll('.tab');
+        const containers = document.querySelectorAll('.list-container');
+        
+        console.log('Initializing tabs:', tabs.length, 'containers:', containers.length);
+        
+        // First, hide all containers and remove active classes
+        containers.forEach((container, index) => {
+            container.classList.remove('active');
+            container.style.display = 'none';
+            console.log(`Container ${index} hidden`);
+        });
+        
+        // Remove active class from all tabs
+        tabs.forEach(tab => {
+            tab.classList.remove('active');
+        });
+        
+        // Activate first tab and container
+        if (tabs.length > 0 && containers.length > 0) {
+            tabs[0].classList.add('active');
+            containers[0].classList.add('active');
+            containers[0].style.display = 'block';
+            console.log('First tab and container activated');
+        }
+        
+        // Add click event listeners to tabs
+        tabs.forEach((tab, index) => {
+            tab.addEventListener('click', () => {
+                const tabType = tab.getAttribute('data-tab');
+                console.log(`Tab clicked: ${tabType} (index: ${index})`);
+                
+                // Remove active class from all tabs
+                tabs.forEach(t => t.classList.remove('active'));
+                
+                // Hide all containers
+                containers.forEach(c => {
+                    c.classList.remove('active');
+                    c.style.display = 'none';
+                });
+                
+                // Activate clicked tab
+                tab.classList.add('active');
+                
+                // Show corresponding container
+                const targetContainer = document.querySelector(`.list-container[data-content="${tabType}"]`);
+                if (targetContainer) {
+                    targetContainer.classList.add('active');
+                    targetContainer.style.display = 'block';
+                    console.log(`Activated container for ${tabType}`);
+                } else {
+                    console.error(`Container not found for tab: ${tabType}`);
+                }
+            });
+        });
+    }
+    
+    // ALSO ADD this function to be called after DOM is fully loaded:
+    function ensureTabsInitialized() {
+        // Wait a bit for DOM to settle, then ensure tabs are properly initialized
+        setTimeout(() => {
+            const containers = document.querySelectorAll('.list-container');
+            const activeContainer = document.querySelector('.list-container.active');
+            
+            if (!activeContainer) {
+                console.log('No active container found, forcing initialization');
+                if (containers.length > 0) {
+                    containers[0].classList.add('active');
+                    containers[0].style.display = 'block';
+                    
+                    // Also ensure first tab is active
+                    const firstTab = document.querySelector('.tab');
+                    if (firstTab) {
+                        firstTab.classList.add('active');
+                    }
+                }
+            }
+            
+            // Double-check that non-active containers are hidden
+            containers.forEach(container => {
+                if (!container.classList.contains('active')) {
+                    container.style.display = 'none';
+                }
+            });
+        }, 100);
     }
 
+// ALSO UPDATE the addEmptyStateMessages function:
+
+function addEmptyStateMessages() {
+    const filesToSendList = document.getElementById('files-to-send');
+    const receivedFilesList = document.getElementById('received-files');
+    
+    // Function to add empty state if needed
+    const addEmptyStateIfNeeded = (listElement, message, iconClass) => {
+        if (!listElement) return;
+        
+        const fileItems = Array.from(listElement.children).filter(child => 
+            !child.classList.contains('empty-state'));
+        
+        if (fileItems.length === 0 && !listElement.querySelector('.empty-state')) {
+            const emptyMessage = document.createElement('li');
+            emptyMessage.className = 'empty-state';
+            emptyMessage.innerHTML = `<i class="fas ${iconClass}"></i> ${message}`;
+            emptyMessage.style.cssText = `
+                display: flex !important;
+                align-items: center;
+                justify-content: center;
+                height: 150px;
+                color: rgba(224, 224, 255, 0.6);
+                font-style: italic;
+                text-align: center;
+                background-color: rgba(30, 40, 70, 0.2);
+                border: 2px dashed rgba(66, 134, 244, 0.3);
+                border-radius: 8px;
+                margin: 20px 0;
+                flex-direction: column;
+                gap: 10px;
+            `;
+            listElement.appendChild(emptyMessage);
+        }
+    };
+    
+    // Add initial empty states
+    addEmptyStateIfNeeded(filesToSendList, 'No files selected for sending', 'fa-paper-plane');
+    addEmptyStateIfNeeded(receivedFilesList, 'No files received yet', 'fa-inbox');
+    
+    // Set up mutation observers to manage empty state messages
+    setupEmptyStateObservers(filesToSendList, 'No files selected for sending', 'fa-paper-plane');
+    setupEmptyStateObservers(receivedFilesList, 'No files received yet', 'fa-inbox');
+}
+
+function setupEmptyStateObservers(listElement, emptyMessage, iconClass) {
+    if (!listElement) return;
+    
+    const observer = new MutationObserver(mutations => {
+        mutations.forEach(mutation => {
+            if (mutation.type === 'childList') {
+                const fileItems = Array.from(listElement.children).filter(child => 
+                    !child.classList.contains('empty-state'));
+                
+                if (fileItems.length > 0) {
+                    // Remove empty state messages
+                    const emptyStates = listElement.querySelectorAll('.empty-state');
+                    emptyStates.forEach(el => el.remove());
+                } else if (listElement.querySelectorAll('.empty-state').length === 0) {
+                    // Add empty state message
+                    const emptyEl = document.createElement('li');
+                    emptyEl.className = 'empty-state';
+                    emptyEl.innerHTML = `<i class="fas ${iconClass}"></i> ${emptyMessage}`;
+                    emptyEl.style.cssText = `
+                        display: flex !important;
+                        align-items: center;
+                        justify-content: center;
+                        height: 150px;
+                        color: rgba(224, 224, 255, 0.6);
+                        font-style: italic;
+                        text-align: center;
+                        background-color: rgba(30, 40, 70, 0.2);
+                        border: 2px dashed rgba(66, 134, 244, 0.3);
+                        border-radius: 8px;
+                        margin: 20px 0;
+                        flex-direction: column;
+                        gap: 10px;
+                    `;
+                    listElement.appendChild(emptyEl);
+                }
+            }
+        });
+    });
+    
+    observer.observe(listElement, { childList: true });
+}
+    
     function getFileTypeIcon(fileName) {
         const extension = fileName.split('.').pop().toLowerCase();
         
@@ -1001,6 +1141,13 @@ function assembleAndSaveFile(fileId) {
     
     console.log('File assembled and download initiated:', fileName);
 }
+
+ // Initialize the application
+ init();
+    
+ // ADD THIS LINE at the very end of DOMContentLoaded:
+ ensureTabsInitialized();
+ 
 });
 
 // Export functions for testing if needed
