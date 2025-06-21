@@ -59,6 +59,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const MAX_CHUNKS_IN_FLIGHT = 10; // Maximum number of chunks to send before waiting for acknowledgment
     let chunksInFlight = 0; // Track how many chunks are currently being sent
     let transferQueue = []; // Queue for files waiting to be sent
+    
+    const AUTO_DOWNLOAD_ENABLED = true; 
+    const MAX_FILES_TO_KEEP = 5;
+    const fileHistory = {
+        sent: [],
+        received: []
+    };
 
     // Check if URL has a peer ID (client mode)
     // Handle both query parameter format and path format
@@ -696,12 +703,50 @@ function setupEmptyStateObservers(listElement, emptyMessage, iconClass) {
             downloadText.textContent = 'Download';
             downloadLink.appendChild(downloadText);
             
+            // IMPROVED: Better download handler that prevents double downloads
+            downloadLink.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                console.log('Manual download requested for:', fileName);
+                
+                // Find the file in history
+                const fileInfo = fileHistory.received.find(f => f.fileId === fileId);
+                if (fileInfo && fileInfo.blob) {
+                    // Create fresh URL for download
+                    const url = URL.createObjectURL(fileInfo.blob);
+                    
+                    triggerFileDownload(url, fileName);
+                    
+                    // Clean up the temporary URL after download
+                    setTimeout(() => {
+                        URL.revokeObjectURL(url);
+                    }, 1000);
+                    
+                    console.log('Manual download completed for:', fileName);
+                } else {
+                    alert('File data no longer available. Please request the file again.');
+                }
+            });
+            
             li.appendChild(downloadLink);
         }
         
         console.log('Appending file element to list:', listElement?.id);
         listElement.appendChild(li);
         console.log('File element appended successfully');
+        
+        // Add to history for sent files
+        if (fileType === 'send') {
+            fileHistory.sent.push({
+                fileId: fileId,
+                fileName: fileName,
+                timestamp: Date.now()
+            });
+        }
+        
+        // Maintain file limit
+        maintainFileLimit(fileType);
         
         // Make sure the list is visible
         if (listElement && listElement.parentElement) {
@@ -712,7 +757,8 @@ function setupEmptyStateObservers(listElement, emptyMessage, iconClass) {
             }
         }
     }
-
+    
+    // UPDATED updateFileStatus function
     function updateFileStatus(listElement, fileId, status, progress, downloadUrl = null, fileName = null) {
         const li = document.getElementById(`file-${fileId}`);
         if (!li) return;
@@ -755,33 +801,14 @@ function setupEmptyStateObservers(listElement, emptyMessage, iconClass) {
             }
         }
         
-        // Add download link if available
-        if (downloadUrl && fileName) {
-            let downloadLink = li.querySelector('.download-button');
-            
-            if (!downloadLink) {
-                downloadLink = document.createElement('a');
+        // Show download button for completed received files
+        if (downloadUrl && fileName && status === 'Received') {
+            const downloadLink = li.querySelector('.download-button');
+            if (downloadLink) {
+                downloadLink.style.display = 'flex';
+                // Update the href for initial download (but the click handler will handle re-downloads)
                 downloadLink.href = downloadUrl;
-                downloadLink.download = fileName;
-                downloadLink.className = 'download-button';
-                
-                const downloadIcon = document.createElement('i');
-                downloadIcon.className = 'fas fa-download';
-                downloadLink.appendChild(downloadIcon);
-                
-                const downloadText = document.createElement('span');
-                downloadText.className = 'download-text';
-                downloadText.textContent = 'Download';
-                downloadLink.appendChild(downloadText);
-                
-                downloadLink.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                });
-                
-                li.appendChild(downloadLink);
             }
-            
-            downloadLink.style.display = status === 'Received' || status === 'Complete' ? 'flex' : 'none';
         }
     }
 
@@ -1116,13 +1143,38 @@ function assembleAndSaveFile(fileId) {
     
     console.log('Final blob size:', blob.size);
     
-    // Create download URL
+    // CRITICAL FIX: Store blob data for persistent downloads
+    fileHistory.received.push({
+        fileId: fileId,
+        fileName: fileName,
+        blob: blob,
+        timestamp: Date.now(),
+        autoDownloaded: false // Track if auto-download has occurred
+    });
+    
+    // Create download URL that won't be revoked immediately
     const url = URL.createObjectURL(blob);
     
     // Update UI to show file is ready for download
     updateFileStatus(receivedFilesList, fileId, 'Received', 100, url, fileName);
     
-    // Auto-download the file
+    // CONFIGURABLE AUTO-DOWNLOAD: Only auto-download if enabled and not already downloaded
+    const fileInfo = fileHistory.received.find(f => f.fileId === fileId);
+    if (AUTO_DOWNLOAD_ENABLED && fileInfo && !fileInfo.autoDownloaded) {
+        console.log('Auto-downloading file:', fileName);
+        triggerFileDownload(url, fileName);
+        fileInfo.autoDownloaded = true; // Mark as auto-downloaded
+    } else if (!AUTO_DOWNLOAD_ENABLED) {
+        console.log('Auto-download disabled. File ready for manual download:', fileName);
+    }
+    
+    // Clean up old files and maintain max limit
+    maintainFileLimit('received');
+    
+    console.log('File assembled and ready for download:', fileName);
+}
+
+function triggerFileDownload(url, fileName) {
     const a = document.createElement('a');
     a.href = url;
     a.download = fileName;
@@ -1130,16 +1182,95 @@ function assembleAndSaveFile(fileId) {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    console.log('Download triggered for:', fileName);
+}
+
+function maintainFileLimit(type) {
+    const isReceived = type === 'received';
+    const history = isReceived ? fileHistory.received : fileHistory.sent;
+    const listElement = isReceived ? receivedFilesList : filesToSendList;
     
-    // Clean up the URL after a delay to allow download
-    setTimeout(() => {
-        URL.revokeObjectURL(url);
-    }, 1000);
+    // Sort by timestamp (newest first)
+    history.sort((a, b) => b.timestamp - a.timestamp);
     
-    // Clean up the received files entry
-    delete receivedFiles[fileId];
+    // If we have more than MAX_FILES_TO_KEEP, remove the oldest ones
+    if (history.length > MAX_FILES_TO_KEEP) {
+        const filesToRemove = history.splice(MAX_FILES_TO_KEEP);
+        
+        filesToRemove.forEach(fileInfo => {
+            // Remove from UI
+            const fileElement = document.getElementById(`file-${fileInfo.fileId}`);
+            if (fileElement) {
+                fileElement.remove();
+                console.log(`Removed old file from UI: ${fileInfo.fileName}`);
+            }
+            
+            // Clean up blob URLs for received files
+            if (isReceived && fileInfo.blob) {
+                // Find and revoke any URLs associated with this blob
+                const downloadButton = fileElement?.querySelector('.download-button');
+                if (downloadButton && downloadButton.href.startsWith('blob:')) {
+                    URL.revokeObjectURL(downloadButton.href);
+                }
+                
+                // Clean up the blob itself to free memory
+                fileInfo.blob = null;
+            }
+            
+            // Clean up from receivedFiles or filesToSend
+            if (isReceived) {
+                delete receivedFiles[fileInfo.fileId];
+            } else {
+                delete filesToSend[fileInfo.fileId];
+            }
+        });
+        
+        console.log(`Cleaned up ${filesToRemove.length} old ${type} files`);
+    }
     
-    console.log('File assembled and download initiated:', fileName);
+    // Update empty state if needed
+    checkAndUpdateEmptyState(listElement);
+}
+
+
+function checkAndUpdateEmptyState(listElement) {
+    if (!listElement) return;
+    
+    const fileItems = Array.from(listElement.children).filter(child => 
+        !child.classList.contains('empty-state'));
+    
+    const emptyStates = listElement.querySelectorAll('.empty-state');
+    
+    if (fileItems.length === 0 && emptyStates.length === 0) {
+        // Add empty state
+        const message = listElement === receivedFilesList ? 
+            'No files received yet' : 'No files selected for sending';
+        const iconClass = listElement === receivedFilesList ? 
+            'fa-inbox' : 'fa-paper-plane';
+            
+        const emptyEl = document.createElement('li');
+        emptyEl.className = 'empty-state';
+        emptyEl.innerHTML = `<i class="fas ${iconClass}"></i> ${message}`;
+        emptyEl.style.cssText = `
+            display: flex !important;
+            align-items: center;
+            justify-content: center;
+            height: 150px;
+            color: rgba(224, 224, 255, 0.6);
+            font-style: italic;
+            text-align: center;
+            background-color: rgba(30, 40, 70, 0.2);
+            border: 2px dashed rgba(66, 134, 244, 0.3);
+            border-radius: 8px;
+            margin: 20px 0;
+            flex-direction: column;
+            gap: 10px;
+        `;
+        listElement.appendChild(emptyEl);
+    } else if (fileItems.length > 0) {
+        // Remove empty states
+        emptyStates.forEach(el => el.remove());
+    }
 }
 
  // Initialize the application
@@ -1147,7 +1278,31 @@ function assembleAndSaveFile(fileId) {
     
  // ADD THIS LINE at the very end of DOMContentLoaded:
  ensureTabsInitialized();
- 
+
+});
+
+window.addEventListener('beforeunload', () => {
+    console.log('Cleaning up blob URLs and memory...');
+    
+    // Clean up all blob URLs to prevent memory leaks
+    fileHistory.received.forEach(fileInfo => {
+        if (fileInfo.blob) {
+            const fileElement = document.getElementById(`file-${fileInfo.fileId}`);
+            const downloadButton = fileElement?.querySelector('.download-button');
+            if (downloadButton && downloadButton.href.startsWith('blob:')) {
+                URL.revokeObjectURL(downloadButton.href);
+            }
+            
+            // Clear blob reference
+            fileInfo.blob = null;
+        }
+    });
+    
+    // Clear file history arrays
+    fileHistory.received.length = 0;
+    fileHistory.sent.length = 0;
+    
+    console.log('Cleanup completed');
 });
 
 // Export functions for testing if needed
