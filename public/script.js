@@ -59,6 +59,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const MAX_CHUNKS_IN_FLIGHT = 10; // Maximum number of chunks to send before waiting for acknowledgment
     let chunksInFlight = 0; // Track how many chunks are currently being sent
     let transferQueue = []; // Queue for files waiting to be sent
+
+    // Support for File System Access API
+    const supportsFileSystemAccess = !!(navigator.storage && navigator.storage.getDirectory);
+    const LARGE_FILE_WARNING_SIZE = 1024 * 1024 * 500; // 500MB threshold for warnings
     
     const AUTO_DOWNLOAD_ENABLED = true; 
     const MAX_FILES_TO_KEEP = 5;
@@ -989,22 +993,16 @@ function setupEmptyStateObservers(listElement, emptyMessage, iconClass) {
         }
     }
 
-    function handleMessage(message) {
+    async function handleMessage(message) {
         console.log('Received message:', message);
-        
+
         switch (message.type) {
             case 'greeting':
                 console.log('Peer says:', message.message);
                 break;
-                
+
             case 'file-metadata':
-                receivedFiles[message.fileId] = {
-                    metadata: message,
-                    chunks: new Array(message.chunks),
-                    receivedChunks: 0,
-                    complete: false
-                };
-                
+                await setupReceivedFile(message);
                 addFileToUI(receivedFilesList, message.fileId, message.name, message.size, 'Receiving 0%');
                 break;
                 
@@ -1024,9 +1022,45 @@ function setupEmptyStateObservers(listElement, emptyMessage, iconClass) {
         }
     }
 
+    async function setupReceivedFile(metadata) {
+        try {
+            if (supportsFileSystemAccess) {
+                const dir = await navigator.storage.getDirectory();
+                const handle = await dir.getFileHandle(metadata.fileId, { create: true });
+                const writable = await handle.createWritable();
+                receivedFiles[metadata.fileId] = {
+                    metadata,
+                    writable,
+                    fileHandle: handle,
+                    receivedChunks: 0,
+                    complete: false
+                };
+            } else {
+                if (metadata.size > LARGE_FILE_WARNING_SIZE) {
+                    alert('Receiving a large file without File System Access API support may use a lot of memory.');
+                }
+                receivedFiles[metadata.fileId] = {
+                    metadata,
+                    chunks: new Array(metadata.chunks),
+                    receivedChunks: 0,
+                    complete: false
+                };
+            }
+        } catch (err) {
+            console.error('Failed to prepare file for receiving:', err);
+            // Fallback to in-memory storage
+            receivedFiles[metadata.fileId] = {
+                metadata,
+                chunks: new Array(metadata.chunks),
+                receivedChunks: 0,
+                complete: false
+            };
+        }
+    }
+
  // REPLACE these two functions in your script.js file:
 
-function handleFileChunk(data) {
+async function handleFileChunk(data) {
     try {
         const dataView = new Uint8Array(data);
         
@@ -1053,8 +1087,11 @@ function handleFileChunk(data) {
                 return;
             }
             
-            // CRITICAL FIX: Store chunk as ArrayBuffer to preserve binary data
-            fileData.chunks[chunkIndex] = chunkData;
+            if (fileData.writable) {
+                await fileData.writable.write({ type: 'write', position: chunkIndex * CHUNK_SIZE, data: chunkData });
+            } else {
+                fileData.chunks[chunkIndex] = chunkData;
+            }
             fileData.receivedChunks++;
             
             console.log(`Received chunk ${chunkIndex}/${fileData.metadata.chunks - 1} for ${fileData.metadata.name} (${chunkData.byteLength} bytes)`);
@@ -1084,62 +1121,75 @@ function handleFileChunk(data) {
     }
 }
 
-function assembleAndSaveFile(fileId) {
+async function assembleAndSaveFile(fileId) {
     const fileData = receivedFiles[fileId];
     if (!fileData) {
         console.error('No file data found for fileId:', fileId);
         return;
     }
-    
-    const chunks = fileData.chunks;
+
     const mimeType = fileData.metadata.mimeType;
     const fileName = fileData.metadata.name;
-    
+
     console.log('Assembling file:', fileName);
-    console.log('Total chunks:', chunks.length);
-    console.log('Chunks received:', fileData.receivedChunks);
-    
-    // CRITICAL FIX: Verify all chunks are present and convert to proper format
-    const validChunks = [];
-    let totalSize = 0;
-    
-    for (let i = 0; i < chunks.length; i++) {
-        if (!chunks[i]) {
-            console.error(`Missing chunk ${i} for file ${fileName}`);
-            updateFileStatus(receivedFilesList, fileId, 'Error: Missing chunks', 0);
+    let blob;
+
+    if (fileData.writable) {
+        try {
+            await fileData.writable.close();
+            const file = await fileData.fileHandle.getFile();
+            blob = file;
+        } catch (err) {
+            console.error('Error closing writable stream:', err);
             return;
         }
-        
-        // Convert chunk to Uint8Array if it's an ArrayBuffer
-        let chunkData;
-        if (chunks[i] instanceof ArrayBuffer) {
-            chunkData = new Uint8Array(chunks[i]);
-        } else if (chunks[i] instanceof Uint8Array) {
-            chunkData = chunks[i];
-        } else {
-            console.error('Invalid chunk type at index', i, ':', typeof chunks[i]);
-            updateFileStatus(receivedFilesList, fileId, 'Error: Invalid chunk data', 0);
+    } else {
+        const chunks = fileData.chunks;
+        console.log('Total chunks:', chunks.length);
+        console.log('Chunks received:', fileData.receivedChunks);
+
+        // CRITICAL FIX: Verify all chunks are present and convert to proper format
+        const validChunks = [];
+        let totalSize = 0;
+
+        for (let i = 0; i < chunks.length; i++) {
+            if (!chunks[i]) {
+                console.error(`Missing chunk ${i} for file ${fileName}`);
+                updateFileStatus(receivedFilesList, fileId, 'Error: Missing chunks', 0);
+                return;
+            }
+
+            // Convert chunk to Uint8Array if it's an ArrayBuffer
+            let chunkData;
+            if (chunks[i] instanceof ArrayBuffer) {
+                chunkData = new Uint8Array(chunks[i]);
+            } else if (chunks[i] instanceof Uint8Array) {
+                chunkData = chunks[i];
+            } else {
+                console.error('Invalid chunk type at index', i, ':', typeof chunks[i]);
+                updateFileStatus(receivedFilesList, fileId, 'Error: Invalid chunk data', 0);
+                return;
+            }
+
+            validChunks.push(chunkData);
+            totalSize += chunkData.byteLength;
+        }
+
+        console.log('Original file size:', fileData.metadata.size);
+        console.log('Assembled size:', totalSize);
+
+        // Verify file size matches (allow small difference due to chunking)
+        if (Math.abs(totalSize - fileData.metadata.size) > CHUNK_SIZE) {
+            console.error(`File size mismatch! Expected: ${fileData.metadata.size}, Got: ${totalSize}`);
+            updateFileStatus(receivedFilesList, fileId, 'Error: Size mismatch', 0);
             return;
         }
-        
-        validChunks.push(chunkData);
-        totalSize += chunkData.byteLength;
+
+        // CRITICAL FIX: Create blob with proper MIME type and binary data
+        blob = new Blob(validChunks, {
+            type: mimeType || 'application/octet-stream'
+        });
     }
-    
-    console.log('Original file size:', fileData.metadata.size);
-    console.log('Assembled size:', totalSize);
-    
-    // Verify file size matches (allow small difference due to chunking)
-    if (Math.abs(totalSize - fileData.metadata.size) > CHUNK_SIZE) {
-        console.error(`File size mismatch! Expected: ${fileData.metadata.size}, Got: ${totalSize}`);
-        updateFileStatus(receivedFilesList, fileId, 'Error: Size mismatch', 0);
-        return;
-    }
-    
-    // CRITICAL FIX: Create blob with proper MIME type and binary data
-    const blob = new Blob(validChunks, { 
-        type: mimeType || 'application/octet-stream' 
-    });
     
     console.log('Final blob size:', blob.size);
     
