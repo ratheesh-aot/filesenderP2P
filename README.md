@@ -25,7 +25,7 @@ A peer-to-peer file sharing web application that allows users to share files dir
 - Uses WebRTC for direct peer-to-peer data transfer
 - PeerJS library simplifies WebRTC implementation
 - Files are chunked and streamed for efficient transfer
-- Supports large file transfers
+- Supports large file transfers. When available, the browser's File System Access API is used to store incoming data directly to disk to avoid high memory usage.
 - Works across different networks through STUN servers
 
 ## Getting Started
