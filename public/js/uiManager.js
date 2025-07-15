@@ -310,6 +310,7 @@ export function addFileToUI(listElement, fileId, fileName, fileSize, status) {
             <div class="file-status">${status}</div>
             <div class="progress-container">
                 <div class="progress-bar" style="width: 0%"></div>
+                <div class="progress-percentage">0%</div>
             </div>
         </div>
         <div class="file-actions">
@@ -342,10 +343,16 @@ export function updateFileStatus(listElement, fileId, status, progress, download
         statusElement.textContent = status;
     }
     
-    // Update progress bar
+    // Update progress bar and percentage
     const progressBar = fileElement.querySelector('.progress-bar');
     if (progressBar) {
         progressBar.style.width = `${progress}%`;
+    }
+    
+    // Update progress percentage text
+    const progressPercentage = fileElement.querySelector('.progress-percentage');
+    if (progressPercentage) {
+        progressPercentage.textContent = `${progress}%`;
     }
     
     // Show/hide progress bar based on status

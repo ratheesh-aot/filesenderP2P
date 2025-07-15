@@ -471,24 +471,56 @@ li {
 }
 
 li::before {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 4px;
-    height: 100%;
-    background: linear-gradient(to bottom, #4286f4, #42f4a1);
-    opacity: 0.7;
+content: '';
+position: absolute;
+top: 0;
+left: 0;
+width: 4px;
+height: 100%;
+background: linear-gradient(to bottom, #4286f4, #42f4a1);
+opacity: 0.7;
 }
 
 li:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(66, 134, 244, 0.15);
-    border-color: rgba(66, 134, 244, 0.6);
+transform: translateY(-2px);
+box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4), inset 0 0 12px rgba(66, 134, 244, 0.15);
+border-color: rgba(66, 134, 244, 0.6);
 }
 
 li:hover::before {
-    opacity: 1;
+opacity: 1;
+}
+
+.progress-bar {
+height: 100%;
+background: linear-gradient(90deg, #4286f4, #42f4a1);
+transition: width 0.3s ease;
+position: relative;
+box-shadow: 0 0 10px rgba(66, 134, 244, 0.7);
+}
+
+.progress-percentage {
+position: absolute;
+right: 10px;
+top: 50%;
+transform: translateY(-50%);
+color: #ffffff;
+font-size: 0.85em;
+font-weight: 600;
+text-shadow: 0 0 3px rgba(0, 0, 0, 0.5);
+z-index: 5;
+}
+
+.progress-container {
+position: relative;
+width: 100%;
+height: 20px;
+margin-top: 8px;
+background-color: rgba(30, 40, 70, 0.5);
+border-radius: 10px;
+overflow: hidden;
+box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.2);
+border: 1px solid rgba(66, 134, 244, 0.2);
 }
 
 @keyframes slideIn {
@@ -640,18 +672,17 @@ li a.download-button:hover, .download-button:hover {
 .progress-bar {
     height: 100%;
     background: linear-gradient(90deg, #4286f4, #42f4a1);
-    transition: width 0.3s ease;
-    position: relative;
-    box-shadow: 0 0 10px rgba(66, 134, 244, 0.7);
 }
 
-.progress-bar::after {
-    content: '';
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
+.progress-bar-container::after {
+content: '';
+position: absolute;
+top: 0;
+left: 0;
+right: 0;
+height: 50%;
+background: linear-gradient(to bottom, rgba(255, 255, 255, 0.1), transparent);
+pointer-events: none;
     background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
     animation: progress-shine 2s linear infinite;
 }
