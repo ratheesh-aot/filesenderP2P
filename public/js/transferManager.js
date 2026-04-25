@@ -9,8 +9,10 @@ let connectionManager;
 
 // Transfer settings
 const CHUNK_SIZE = 64 * 1024; // 64KB chunks
-const MAX_CHUNKS_IN_FLIGHT = 10; // Maximum number of chunks to send before waiting for acknowledgment
-let chunksInFlight = 0; // Track how many chunks are currently being sent
+const MAX_CHUNKS_IN_FLIGHT = 3; // Max outstanding unacknowledged chunks
+const BUFFER_THRESHOLD = 512 * 1024; // Pause sending if WebRTC channel buffer exceeds 512KB
+let chunksInFlight = 0;
+let isTransferring = false; // True while a file is actively being transferred
 let transferQueue = []; // Queue for files waiting to be sent
 let pendingChunks = new Map(); // Track chunks that have been sent but not acknowledged
 
@@ -82,19 +84,17 @@ export function handleFiles(fileList) {
  * Process the transfer queue
  */
 export function processTransferQueue() {
-    if (transferQueue.length === 0 || chunksInFlight >= MAX_CHUNKS_IN_FLIGHT) {
+    if (transferQueue.length === 0 || isTransferring) {
         return;
     }
 
-    // Check if we have a connection before trying to send
     if (!connectionManager || !connectionManager.isConnected()) {
         console.log('Cannot process transfer queue: No connection');
         return;
     }
 
     const { fileId, file } = transferQueue[0];
-
-    // Start sending this file
+    isTransferring = true;
     sendFileMetadata(fileId, file);
 }
 
@@ -133,53 +133,38 @@ function sendFileChunks(fileId, file) {
     const fileInfo = fileManager.getFileToSend(fileId);
     if (!fileInfo) return;
 
-    // Reset sending state
     fileInfo.sentChunks = 0;
-
-    // Start sending chunks
+    chunksInFlight = 0; // Reset counter cleanly for this file
     continueSendingChunks(fileId);
 }
 
 /**
- * Send a single file chunk
+ * Send a single file chunk, with backpressure retry if the channel buffer is full
  * @param {string} fileId - File ID
  * @param {number} chunkIndex - Chunk index
  * @param {Blob} chunk - Chunk data
  */
 function sendFileChunk(fileId, chunkIndex, chunk) {
-    // Read chunk as array buffer
+    const chunkKey = `${fileId}-${chunkIndex}`;
     const reader = new FileReader();
 
     reader.onerror = (e) => {
         console.error(`Error reading chunk ${chunkIndex} for file ${fileId}:`, e);
         chunksInFlight--;
-
-        // Remove from pending chunks
-        const chunkKey = `${fileId}-${chunkIndex}`;
         pendingChunks.delete(chunkKey);
-
-        // Update file status to error
-        fileManager.updateFileStatus(fileId, 'send', {
-            status: 'error - read failed'
-        });
+        fileManager.updateFileStatus(fileId, 'send', { status: 'error - read failed' });
+        abortTransfer(fileId);
     };
 
     reader.onload = (e) => {
         const arrayBuffer = e.target.result;
 
-        // Check if we have a connection
         if (!connectionManager || !connectionManager.isConnected()) {
             console.error(`Cannot send chunk ${chunkIndex}: No connection`);
             chunksInFlight--;
-
-            // Remove from pending chunks
-            const chunkKey = `${fileId}-${chunkIndex}`;
             pendingChunks.delete(chunkKey);
-
-            // Update file status to error
-            fileManager.updateFileStatus(fileId, 'send', {
-                status: 'error - no connection'
-            });
+            fileManager.updateFileStatus(fileId, 'send', { status: 'error - no connection' });
+            abortTransfer(fileId);
             return;
         }
 
@@ -191,7 +176,6 @@ function sendFileChunk(fileId, chunkIndex, chunk) {
         }
         const base64Data = btoa(binaryString);
 
-        // Create message with base64 encoded chunk
         const message = {
             type: 'file-chunk',
             fileId: fileId,
@@ -200,27 +184,47 @@ function sendFileChunk(fileId, chunkIndex, chunk) {
             chunk: base64Data
         };
 
-        // Send the message
-        const sent = sendMessage(message);
-        if (!sent) {
-            console.error(`Failed to send chunk ${chunkIndex} for file ${fileId}`);
-            chunksInFlight--;
+        // Retry with backoff if the WebRTC channel buffer is too full
+        const trySend = () => {
+            if (!connectionManager || !connectionManager.isConnected()) {
+                chunksInFlight--;
+                pendingChunks.delete(chunkKey);
+                fileManager.updateFileStatus(fileId, 'send', { status: 'error - no connection' });
+                abortTransfer(fileId);
+                return;
+            }
+            if (connectionManager.getBufferedAmount() > BUFFER_THRESHOLD) {
+                setTimeout(trySend, 50);
+                return;
+            }
+            const sent = sendMessage(message);
+            if (!sent) {
+                console.error(`Failed to send chunk ${chunkIndex} for file ${fileId}`);
+                chunksInFlight--;
+                pendingChunks.delete(chunkKey);
+                fileManager.updateFileStatus(fileId, 'send', { status: 'error - send failed' });
+                abortTransfer(fileId);
+                return;
+            }
+            console.log(`Sent chunk ${chunkIndex} for file ${fileId} (${arrayBuffer.byteLength} bytes)`);
+        };
 
-            // Remove from pending chunks
-            const chunkKey = `${fileId}-${chunkIndex}`;
-            pendingChunks.delete(chunkKey);
-
-            // Update file status to error
-            fileManager.updateFileStatus(fileId, 'send', {
-                status: 'error - send failed'
-            });
-            return;
-        }
-
-        console.log(`Sent chunk ${chunkIndex} for file ${fileId} (${arrayBuffer.byteLength} bytes, base64: ${base64Data.length} chars)`);
+        trySend();
     };
 
     reader.readAsArrayBuffer(chunk);
+}
+
+/**
+ * Remove an errored file from the transfer queue and continue with the next one
+ * @param {string} fileId - File ID that errored
+ */
+function abortTransfer(fileId) {
+    transferQueue = transferQueue.filter(item => item.fileId !== fileId);
+    isTransferring = false;
+    if (transferQueue.length > 0) {
+        processTransferQueue();
+    }
 }
 
 /**
@@ -297,19 +301,13 @@ function handleChunkAcknowledgment(message) {
         if (fileInfo.acknowledgedChunks === fileInfo.chunks) {
             console.log(`All chunks acknowledged for file ${fileId}, sending file-complete`);
 
-            // Send file complete message
-            sendMessage({
-                type: 'file-complete',
-                fileId: fileId
-            });
-
-            // Mark file as complete
+            sendMessage({ type: 'file-complete', fileId: fileId });
             fileManager.completeFile(fileId, 'send');
 
-            // Remove from transfer queue
             transferQueue = transferQueue.filter(item => item.fileId !== fileId);
+            isTransferring = false;
+            chunksInFlight = 0;
 
-            // Process next file in queue
             if (transferQueue.length > 0) {
                 processTransferQueue();
             }
@@ -346,9 +344,7 @@ function continueSendingChunks(fileId) {
         return;
     }
 
-    // Continue sending chunks from where we left off
     const file = fileInfo.file;
-    const CHUNK_SIZE = 64 * 1024;
 
     while (chunksInFlight < MAX_CHUNKS_IN_FLIGHT && fileInfo.sentChunks < fileInfo.chunks) {
         const chunkIndex = fileInfo.sentChunks;

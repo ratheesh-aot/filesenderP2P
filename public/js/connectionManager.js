@@ -40,7 +40,8 @@ export function initializeConnectionManager(options) {
         isConnected: () => !!connection,
         isHost: () => isHost,
         getPeerId: () => peerId,
-        getConnection: () => connection
+        getConnection: () => connection,
+        getBufferedAmount: () => connection?._channel?.bufferedAmount ?? 0
     };
 }
 
