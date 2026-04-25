@@ -10,6 +10,7 @@ let hostInfoEl;
 let clientInfoEl;
 let shareLinkInput;
 let copyButton;
+let qrCodeContainerEl;
 let dropZone;
 let fileInput;
 let filesToSendList;
@@ -27,6 +28,7 @@ export function initializeUI() {
     clientInfoEl = document.getElementById('client-info');
     shareLinkInput = document.getElementById('share-link');
     copyButton = document.getElementById('copy-button');
+    qrCodeContainerEl = document.getElementById('qrcode-container');
     dropZone = document.getElementById('drop-zone');
     fileInput = document.getElementById('file-input');
     filesToSendList = document.getElementById('files-to-send');
@@ -414,9 +416,27 @@ export function triggerFileDownload(url, fileName) {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    
+
     // Revoke the object URL after download starts
     setTimeout(() => {
         URL.revokeObjectURL(url);
     }, 100);
+}
+
+/**
+ * Generate a QR code for the given URL in the qrcode container
+ * @param {string} url - URL to encode
+ */
+export function generateQRCode(url) {
+    if (!qrCodeContainerEl) return;
+    qrCodeContainerEl.innerHTML = '';
+    // QRCode is loaded as a global from the CDN script
+    new window.QRCode(qrCodeContainerEl, {
+        text: url,
+        width: 160,
+        height: 160,
+        colorDark: '#000000',
+        colorLight: '#ffffff',
+        correctLevel: window.QRCode.CorrectLevel.H
+    });
 }

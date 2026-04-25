@@ -2,7 +2,7 @@
  * Main entry point for FileSender P2P
  * Imports and initializes all modules
  */
-import { initializeUI, updateStatus, setupUIEvents, ensureTabsInitialized, addFileToUI } from './uiManager.js';
+import { initializeUI, updateStatus, setupUIEvents, ensureTabsInitialized, addFileToUI, generateQRCode } from './uiManager.js';
 import { initializeConnectionManager } from './connectionManager.js';
 import { initializeFileManager } from './fileManager.js';
 import { initializeTransferManager, handleFiles, handleMessage } from './transferManager.js';
@@ -71,21 +71,13 @@ document.addEventListener('DOMContentLoaded', () => {
         },
         onShareLinkGenerated: (shareUrl) => {
             console.log('Share link generated:', shareUrl);
-            // Update the share link input field
             if (ui.shareLinkInput) {
                 ui.shareLinkInput.value = shareUrl;
-                console.log('Share link input updated');
-            } else {
-                console.log('Share link input element not found');
             }
-            
-            // Make sure host info is visible
             if (ui.hostInfoEl) {
                 ui.hostInfoEl.style.display = 'block';
-                console.log('Host info element display set to block');
-            } else {
-                console.log('Host info element not found');
             }
+            generateQRCode(shareUrl);
         },
         onConnected: () => {
             console.log('Connected to peer');
