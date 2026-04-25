@@ -22,6 +22,10 @@
                         <input type="text" id="share-link" readonly>
                         <button id="copy-button"><i class="fas fa-copy"></i> Copy</button>
                     </div>
+                    <div id="qrcode-section">
+                        <p class="qrcode-label"><i class="fas fa-qrcode"></i> Or scan to connect:</p>
+                        <div id="qrcode-container"></div>
+                    </div>
                 </div>
                 <div id="client-info" style="display: none;">
                     <p>Connecting to host...</p>
@@ -56,6 +60,8 @@
 
     </div>
     
+    <!-- QR Code library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <!-- Add SimplePeer library -->
     <script src="https://unpkg.com/simple-peer@9.11.1/simplepeer.min.js"></script>
     <script src="script.js" type="module"></script>

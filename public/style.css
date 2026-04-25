@@ -188,6 +188,35 @@ h1::after {
     left: 100%;
 }
 
+#qrcode-section {
+    margin-top: 16px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.qrcode-label {
+    margin: 0 0 10px 0;
+    color: rgba(180, 200, 255, 0.85);
+    font-size: 0.85rem;
+    letter-spacing: 0.5px;
+}
+
+#qrcode-container {
+    background: #ffffff;
+    padding: 10px;
+    border-radius: 10px;
+    box-shadow: 0 0 16px rgba(66, 134, 244, 0.4), 0 4px 12px rgba(0, 0, 0, 0.3);
+    display: inline-block;
+    line-height: 0;
+}
+
+#qrcode-container canvas,
+#qrcode-container img {
+    display: block;
+    border-radius: 4px;
+}
+
 .drop-zone {
     border: 2px dashed rgba(66, 134, 244, 0.5);
     border-radius: 12px;
