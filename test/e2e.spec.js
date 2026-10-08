@@ -133,7 +133,9 @@ async function runTest() {
         console.log('[E2E] Host page loaded');
 
         // Wait for share card and generate host ID from URL
-        await hostPage.waitForSelector('#host-info', { timeout: 20000 });
+        await hostPage.waitForSelector('#choose-send', { timeout: 20000 });
+        await hostPage.click('#choose-send');
+        await hostPage.waitForSelector('#host-info', { visible: true, timeout: 20000 });
         const hostUrl = await hostPage.evaluate(() => {
             const input = document.querySelector('#share-link');
             return input ? input.value : null;

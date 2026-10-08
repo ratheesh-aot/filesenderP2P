@@ -10,7 +10,7 @@
  * fully functional offline after the first visit.
  */
 
-const CACHE_NAME = 'filesender-v4';
+const CACHE_NAME = 'filesender-v9';
 const STATIC_ASSETS = [
     '/',
     '/manifest.webmanifest',
@@ -22,6 +22,9 @@ const STATIC_ASSETS = [
     '/js/transferManager.js',
     '/js/uiManager.js',
     '/js/utils.js',
+    '/js/joinTarget.mjs',
+    '/js/qrScanner.js',
+    '/js/vendor/jsQR.js',
     '/icons/icon-72.svg',
     '/icons/icon-96.svg',
     '/icons/icon-128.svg',

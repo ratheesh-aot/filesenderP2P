@@ -1,12 +1,12 @@
 {
-  "name": "FileSender P2P",
-  "short_name": "FileSender",
-  "description": "Share files directly between browsers over an encrypted peer-to-peer connection. No uploads, no accounts.",
+  "name": "Sendee.xyz",
+  "short_name": "Sendee",
+  "description": "Send a file straight from your browser to a friend. Nothing is uploaded.",
   "start_url": "/",
   "display": "standalone",
   "scope": "/",
-  "theme_color": "#0f172a",
-  "background_color": "#0f172a",
+  "theme_color": "#e7ecef",
+  "background_color": "#1b242c",
   "orientation": "portrait-primary",
   "icons": [
     {

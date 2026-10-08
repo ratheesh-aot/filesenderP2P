@@ -66,24 +66,69 @@ body {
 
 .app-header {
     display: grid;
-    grid-template-columns: 1fr auto 40px;
+    grid-template-columns: minmax(0, 1fr) auto auto;
     align-items: center;
     gap: 12px;
     margin-bottom: 22px;
 }
 
+.header-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
 .app-title {
     margin: 0;
-    font-size: 1.55rem;
+    min-width: 0;
+    font-size: 1.45rem;
     font-weight: 600;
-    letter-spacing: -0.03em;
+    letter-spacing: -0.04em;
     color: var(--ink);
 }
 
-.app-title i {
+.brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+}
+
+.brand-mark {
+    width: 38px;
+    height: 38px;
+    flex: none;
+}
+
+.brand-copy {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    line-height: 1.05;
+}
+
+.brand-name {
+    min-width: 0;
+    white-space: nowrap;
+    letter-spacing: -0.045em;
+}
+
+.brand-tag {
+    margin-top: 3px;
+    color: var(--muted);
+    font-size: 0.78rem;
+    font-weight: 500;
+    letter-spacing: 0;
+    line-height: 1.2;
+    white-space: nowrap;
+}
+
+.brand-tld {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.62em;
+    font-weight: 500;
+    letter-spacing: -0.04em;
     color: var(--wire);
-    margin-right: 6px;
-    font-size: 0.9em;
 }
 
 .status-pill {
@@ -115,8 +160,12 @@ body {
 .status-pill.error .status-dot { background: var(--danger); }
 
 .icon-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     width: 40px;
     height: 40px;
+    padding: 0;
     border-radius: 10px;
     border: 1px solid var(--line);
     background: var(--fill);
@@ -125,6 +174,86 @@ body {
 }
 
 .icon-button:hover { border-color: var(--send); }
+
+.role-choice {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+}
+
+.role-button {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: flex-end;
+    gap: 6px;
+    min-height: 240px;
+    padding: 22px;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+    background: var(--fill);
+    color: var(--ink);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.role-button:hover { border-color: var(--wire); }
+
+.role-icon {
+    display: grid;
+    place-items: center;
+    width: 48px;
+    height: 48px;
+    margin-bottom: auto;
+    border-radius: 12px;
+    background: var(--icon-bg);
+    color: var(--wire);
+    font-size: 1.25rem;
+}
+
+.role-label {
+    font-size: 1.85rem;
+    font-weight: 650;
+    letter-spacing: -0.04em;
+    line-height: 1;
+}
+
+.role-hint {
+    color: var(--muted);
+    font-size: 0.92rem;
+}
+
+.role-send {
+    background: var(--ink);
+    color: var(--card);
+    border-color: var(--ink);
+}
+
+.role-send .role-icon {
+    background: color-mix(in srgb, var(--card) 16%, transparent);
+    color: var(--wire);
+}
+
+.role-send .role-hint { color: color-mix(in srgb, var(--card) 72%, transparent); }
+
+.share-native {
+    display: none;
+    width: 100%;
+    margin-top: 14px;
+    padding: 12px 14px;
+    border: 0;
+    border-radius: 10px;
+    background: var(--send);
+    color: #fff;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.share-native i { margin-right: 8px; }
+
+[data-theme="dark"] .share-native { color: #12202c; }
 
 .share-card,
 #host-info,
@@ -203,6 +332,147 @@ body {
     margin: 0;
     font-size: 1rem;
 }
+
+.join-host {
+    margin-bottom: 18px;
+    padding: 16px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--fill);
+}
+
+.join-note,
+.scanner-status {
+    margin: 0 0 12px;
+    color: var(--muted);
+    font-size: 0.88rem;
+}
+
+.join-actions,
+.join-form {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.join-actions { margin-bottom: 12px; }
+
+.join-form { margin: 0; }
+
+#join-link-input {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--paper);
+    color: var(--ink);
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.78rem;
+}
+
+#scan-qr-button,
+#reconnect-host-button,
+.join-form button {
+    padding: 10px 14px;
+    border: 0;
+    border-radius: 10px;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+#scan-qr-button {
+    background: var(--ink);
+    color: var(--card);
+}
+
+#reconnect-host-button,
+.join-form button {
+    background: var(--send);
+    color: #fff;
+}
+
+[data-theme="dark"] #reconnect-host-button,
+[data-theme="dark"] .join-form button { color: #12202c; }
+
+#scan-qr-button i,
+#reconnect-host-button i { margin-right: 6px; }
+
+.text-button {
+    margin-top: 10px;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--send);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.scanner-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+}
+
+.scanner-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(18, 24, 30, 0.55);
+}
+
+.scanner-panel {
+    position: relative;
+    width: min(420px, calc(100% - 32px));
+    margin: 8vh auto 0;
+    padding: 16px;
+    background: var(--card);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    box-shadow: var(--shadow);
+}
+
+.scanner-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.scanner-head h3 {
+    margin: 0;
+    font-size: 1.05rem;
+}
+
+.scanner-stage {
+    position: relative;
+    margin-bottom: 12px;
+    aspect-ratio: 1;
+    border-radius: 12px;
+    overflow: hidden;
+    background: #0e141a;
+}
+
+#scanner-video {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+.scanner-frame {
+    position: absolute;
+    inset: 16%;
+    border: 2px solid var(--wire);
+    border-radius: 12px;
+    box-shadow: 0 0 0 999px rgba(8, 12, 16, 0.45);
+    pointer-events: none;
+}
+
+.scanner-status { margin: 0; }
 
 .drop-zone {
     display: flex;
@@ -497,8 +767,9 @@ body {
 
 .toast-container {
     position: fixed;
-    right: 16px;
     bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -601,10 +872,15 @@ select:focus-visible {
 @media (max-width: 640px) {
     body { padding: 12px; }
     .container { padding: 18px 14px 16px; border-radius: 14px; }
-    .app-header { grid-template-columns: 1fr 40px; }
-    .app-title { grid-column: 1; grid-row: 1; }
-    .icon-button { grid-column: 2; grid-row: 1; }
+    .app-header { grid-template-columns: minmax(0, 1fr) auto; }
+    .app-title { grid-column: 1; grid-row: 1; font-size: 1.22rem; }
+    .header-tools { grid-column: 2; grid-row: 1; }
+    .brand-mark { width: 34px; height: 34px; }
+    .brand-tag { font-size: 0.7rem; }
     .status-pill { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; }
+    .role-choice { grid-template-columns: 1fr; }
+    .role-button { min-height: 148px; }
+    .share-native { display: inline-flex; align-items: center; justify-content: center; }
     .file-row {
         grid-template-columns: 36px minmax(0, 1fr) auto;
         align-items: center;
@@ -613,6 +889,11 @@ select:focus-visible {
     .file-name { white-space: normal; }
     .file-topline { align-items: flex-start; }
     #share-link { font-size: 0.72rem; }
+    .join-form { flex-direction: column; }
+    .join-form button,
+    #scan-qr-button,
+    #reconnect-host-button { width: 100%; }
+    .scanner-panel { margin-top: 4vh; }
     .setting-row { flex-direction: column; align-items: stretch; }
     .setting-row.toggle-row { flex-direction: row; align-items: center; }
     .setting-row input[type="text"],
@@ -625,6 +906,7 @@ select:focus-visible {
         left: auto;
         width: auto;
         margin: 0 0 12px;
+        transform: none;
     }
     .toast-container:not(:has(.toast)) { display: none; }
     .toast { max-width: none; }
@@ -633,3 +915,29 @@ select:focus-visible {
 @media (prefers-reduced-motion: reduce) {
     * { transition: none !important; animation: none !important; }
 }
+
+/* One stage at a time. The entry script sets data-screen before first paint. */
+#role-choice,
+#share-card,
+#join-host,
+#workspace,
+#connection-status,
+#reset-button,
+.app-footer { display: none; }
+
+html[data-screen="choose"] #role-choice { display: grid; }
+
+html[data-screen="send"] #share-card,
+html[data-screen="receive"] #join-host,
+html[data-screen="session"] #workspace { display: block; }
+
+html[data-screen="send"] #connection-status,
+html[data-screen="receive"] #connection-status,
+html[data-screen="session"] #connection-status { display: inline-flex; }
+
+html[data-screen="send"] #reset-button,
+html[data-screen="receive"] #reset-button,
+html[data-screen="session"] #reset-button { display: inline-flex; }
+
+html[data-screen="send"] .app-footer,
+html[data-screen="receive"] .app-footer { display: flex; }

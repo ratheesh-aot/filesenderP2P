@@ -45,6 +45,8 @@ let callbacks = {
     onBinaryData: () => {},
     onShareLinkGenerated: () => {},
     onPeerName: () => {},
+    onJoiningHost: () => {},
+    onBecameHost: () => {},
 };
 
 /**
@@ -55,19 +57,89 @@ export function initializeConnectionManager(options = {}) {
     callbacks = { ...callbacks, ...options };
     return {
         connect,
+        joinHost,
+        becomeHost,
         sendMessage,
         sendBinary,
         isConnected: () => connected,
         isHost: () => isHost,
         getPeerId: () => peerId,
+        getHostId: () => hostIdFromUrl,
         getPeer: () => peer,
     };
 }
 
+/**
+ * Leave the current role and join another device's room.
+ * Safe to call again after a drop — it sends a fresh join on the open socket.
+ * @param {string} hostId
+ * @returns {{ ok: true, already?: boolean } | { ok: false, reason: 'invalid' | 'self' }}
+ */
+export function joinHost(hostId) {
+    if (!hostId) return { ok: false, reason: 'invalid' };
+    if (hostId === peerId) return { ok: false, reason: 'self' };
+    if (connected && hostIdFromUrl === hostId) return { ok: true, already: true };
+
+    isHost = false;
+    hostIdFromUrl = hostId;
+    rememberHost(hostId);
+    // Silent so a deliberate switch does not also toast "connection lost".
+    teardownPeer('switching host', { silent: true });
+    peerLostNotified = false;
+    clearJoinRetry();
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+
+    callbacks.onStatusUpdate('Connecting to host...', false);
+    callbacks.onJoiningHost();
+
+    if (ws && ws.readyState === WebSocket.OPEN) sendJoin();
+    else if (!ws || ws.readyState !== WebSocket.CONNECTING) openSocket();
+
+    return { ok: true };
+}
+
+/**
+ * Stop joining and publish this device's share link again.
+ * @returns {{ ok: true } | { ok: false, reason: 'connected' }}
+ */
+export function becomeHost() {
+    if (connected) return { ok: false, reason: 'connected' };
+
+    hostIdFromUrl = null;
+    isHost = true;
+    clearJoinRetry();
+    teardownPeer('become host', { silent: true });
+    peerLostNotified = false;
+
+    try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('host');
+        history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    } catch { /* ignore */ }
+
+    const shareUrl = `${window.location.origin}${window.location.pathname}?host=${peerId}`;
+    callbacks.onStatusUpdate('Waiting for peer...', false);
+    callbacks.onShareLinkGenerated(shareUrl);
+    callbacks.onBecameHost();
+    return { ok: true };
+}
+
+function rememberHost(hostId) {
+    try {
+        const url = new URL(window.location.href);
+        if (url.searchParams.get('host') === hostId) return;
+        url.searchParams.set('host', hostId);
+        history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    } catch { /* ignore */ }
+}
+
 // --- Signaling --------------------------------------------------------------------
 export function connect() {
-    callbacks.onStatusUpdate('Connecting to server...', false);
     hostIdFromUrl = readHostParam();
+    callbacks.onStatusUpdate(hostIdFromUrl ? 'Connecting to host...' : 'Connecting to server...', false);
     openSocket();
 }
 
@@ -93,7 +165,7 @@ function openSocket() {
 
         if (hostIdFromUrl) {
             isHost = false;
-            callbacks.onStatusUpdate('Connecting to host...', false);
+            if (!connected) callbacks.onStatusUpdate('Connecting to host...', false);
             sendJoin();
         } else {
             isHost = true;
@@ -159,15 +231,19 @@ function handleSignalingMessage(data) {
             break;
 
         case 'join-sent':
-            callbacks.onStatusUpdate('Establishing connection...', false);
+            if (!connected) callbacks.onStatusUpdate('Establishing connection...', false);
             break;
 
         case 'client-joined':
+            // After this device switches to joining a host, ignore late guests.
+            if (!isHost) break;
             remotePeerId = data.clientId;
             createPeerConnection(data.clientId, true);
             break;
 
         case 'offer':
+            // Hosts send offers. Ignore one that arrives after we switch back to hosting.
+            if (isHost && remotePeerId !== data.sender) break;
             if (remotePeerId !== data.sender) {
                 // A different peer is offering — replace the current one.
                 teardownPeer('replaced');
@@ -196,13 +272,15 @@ function handleSignalingMessage(data) {
             break;
 
         case 'host-left':
-            callbacks.onStatusUpdate('Host disconnected, retrying...', false);
+            if (isHost) break;
             teardownPeer('host left');
+            callbacks.onStatusUpdate('Host disconnected, retrying...', false);
             scheduleJoinRetry();
             break;
 
         case 'error':
             console.error('Signaling server error:', data.message);
+            if (connected) break;
             callbacks.onStatusUpdate(`Server: ${data.message}`, false);
             if (!isHost && /host not found/i.test(data.message || '')) scheduleJoinRetry();
             break;
@@ -247,7 +325,7 @@ function handleOffer(senderId, offer) {
     }
 }
 
-function teardownPeer(reason) {
+function teardownPeer(reason, options = {}) {
     stopHeartbeat();
     const wasConnected = connected;
     connected = false;
@@ -258,7 +336,7 @@ function teardownPeer(reason) {
     }
     remotePeerId = null;
 
-    if (wasConnected && !peerLostNotified) {
+    if (wasConnected && !peerLostNotified && !options.silent) {
         peerLostNotified = true;
         callbacks.onDisconnected(reason || 'disconnected');
     }
@@ -308,10 +386,10 @@ function setupPeerEvents() {
 
     peer.on('error', (err) => {
         console.error('Peer connection error:', err);
+        // An error after the channel is open must not hide the session.
+        // A real drop still arrives through 'close'.
         if (!connected) {
             callbacks.onStatusUpdate(isHost ? 'Waiting for peer...' : 'Connection failed — try again', false);
-        } else {
-            callbacks.onStatusUpdate('Connection error', false);
         }
     });
 

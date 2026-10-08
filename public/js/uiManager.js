@@ -24,6 +24,15 @@ export function initializeUI() {
     els.shareLinkInput = document.getElementById('share-link');
     els.copyButton = document.getElementById('copy-button');
     els.qrContainer = document.getElementById('qrcode-container');
+    els.joinPanel = document.getElementById('join-host');
+    els.joinNote = document.getElementById('join-host-note');
+    els.reconnectButton = document.getElementById('reconnect-host-button');
+    els.hostInsteadButton = document.getElementById('host-instead-button');
+    els.scanButton = document.getElementById('scan-qr-button');
+    els.scannerModal = document.getElementById('scanner-modal');
+    els.scannerStatus = document.getElementById('scanner-status');
+    els.scannerVideo = document.getElementById('scanner-video');
+    els.scannerClose = document.getElementById('scanner-close');
     els.dropZone = document.getElementById('drop-zone');
     els.fileInput = document.getElementById('file-input');
     els.activityList = document.getElementById('activity-list');
@@ -83,12 +92,45 @@ export function showShareCard() {
     if (els.shareCard) els.shareCard.classList.remove('hidden');
 }
 
+/** This device is offering the share link again. */
+export function showHostShare() {
+    showShareCard();
+    els.hostInfo?.classList.remove('hidden');
+    els.clientInfo?.classList.add('hidden');
+}
+
 export function setClientConnectedText(peerName) {
     showShareCard();
     if (els.hostInfo) els.hostInfo.classList.add('hidden');
     if (!els.clientInfo) return;
     els.clientInfo.classList.remove('hidden');
     els.clientInfo.innerHTML = `<p><i class="fas fa-check-circle"></i> Connected${peerName ? ` to <strong>${escapeHtml(peerName)}</strong>` : ''}</p>`;
+}
+
+/** Shown while this device is joining someone else's room. */
+export function showClientPending(text) {
+    showShareCard();
+    if (els.hostInfo) els.hostInfo.classList.add('hidden');
+    if (!els.clientInfo) return;
+    els.clientInfo.classList.remove('hidden');
+    els.clientInfo.innerHTML = `<p><i class="fas fa-link"></i> ${escapeHtml(text)}</p>`;
+}
+
+/**
+ * Join-a-host card. Omit notice or reconnect to leave that part as it is.
+ * @param {{ visible?: boolean, notice?: string, reconnect?: boolean }} state
+ */
+export function setJoinPanel({ notice, reconnect } = {}) {
+    if (typeof notice === 'string' && els.joinNote) els.joinNote.textContent = notice;
+    if (typeof reconnect === 'boolean') {
+        els.reconnectButton?.classList.toggle('hidden', !reconnect);
+        els.hostInsteadButton?.classList.toggle('hidden', !reconnect);
+    }
+}
+
+/** choose | send | receive | session. CSS shows one stage at a time. */
+export function setScreen(screen) {
+    document.documentElement.dataset.screen = screen;
 }
 
 /** Remove one activity row after the user dismisses it. */
@@ -315,7 +357,14 @@ export function initSettingsDrawer({ onDeviceName, onAutoDownload, onTheme }) {
     // Close handlers
     els.settingsDrawer.querySelectorAll('[data-close-settings]').forEach(el =>
         el.addEventListener('click', closeSettings));
-    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        if (isScannerOpen()) {
+            scannerCloseHandler();
+            return;
+        }
+        closeSettings();
+    });
 
     input.value = localStorage.getItem('fs2p-device-name') || '';
     autoToggle.checked = getAutoDownloadDefault();
@@ -336,6 +385,38 @@ export function initSettingsDrawer({ onDeviceName, onAutoDownload, onTheme }) {
 
 export function openSettings() { els.settingsDrawer.classList.remove('hidden'); }
 export function closeSettings() { els.settingsDrawer.classList.add('hidden'); }
+
+// --- QR scanner chrome -----------------------------------------------------------------
+let scannerCloseHandler = () => closeScannerModal();
+
+export function initScanner({ onOpen, onClose }) {
+    scannerCloseHandler = onClose;
+    els.scanButton?.addEventListener('click', onOpen);
+    els.scannerModal?.querySelectorAll('[data-close-scanner]').forEach((el) => {
+        el.addEventListener('click', onClose);
+    });
+}
+
+export function openScannerModal() {
+    els.scannerModal?.classList.remove('hidden');
+    els.scannerClose?.focus();
+}
+
+export function closeScannerModal() {
+    els.scannerModal?.classList.add('hidden');
+}
+
+export function isScannerOpen() {
+    return !!els.scannerModal && !els.scannerModal.classList.contains('hidden');
+}
+
+export function setScannerStatus(text) {
+    if (els.scannerStatus) els.scannerStatus.textContent = text;
+}
+
+export function getScannerVideo() {
+    return els.scannerVideo;
+}
 
 // --- Helpers -------------------------------------------------------------------------------------
 function updateEmptyState() {
