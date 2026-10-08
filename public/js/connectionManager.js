@@ -1,396 +1,404 @@
 /**
- * Connection Manager for FileSender P2P
- * Handles WebSocket and WebRTC connections
+ * Connection Manager v2 for FileSender P2P
+ * Handles WebSocket signaling + WebRTC data channel.
+ *
+ * Improvements over v1:
+ *  - Binary frames (Blob/ArrayBuffer) are routed to onBinaryData instead of
+ *    being force-decoded as UTF-8 text.
+ *  - Stable peerId across reconnects, so share links keep working.
+ *  - Exponential-backoff WebSocket rejoin (2s -> 30s cap); clients auto-rejoin
+ *    their host room after a signaling drop.
+ *  - Data-channel heartbeat: if no activity for PEER_TIMEOUT_MS the peer is
+ *    considered lost and onDisconnected fires with reason 'peer-lost'.
+ *  - Greeting handshake carries the device display name (onPeerName).
  */
+
 import { generateId } from './utils.js';
 
-// Connection state
-let ws; // WebSocket connection
-let peer; // WebRTC peer connection
-let connection; // Active data connection
-let peerId; // Our peer ID
-let isHost = false; // Whether we're the host
-let remotePeerId = null; // Remote peer ID
+const RECONNECT_BASE_MS = 2000;
+const RECONNECT_MAX_MS = 30000;
+const HEARTBEAT_INTERVAL_MS = 10000;
+const PEER_TIMEOUT_MS = 25000;
 
-// Event callbacks
+// --- State --------------------------------------------------------------------
+let ws = null;
+let peer = null;                 // SimplePeer instance
+let connected = false;           // data channel is open
+let peerId = generateId();       // stable for the lifetime of this page load
+let isHost = false;
+let remotePeerId = null;
+let hostIdFromUrl = null;        // set when we opened a ?host= link
+
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let joinRetryTimer = null;
+let heartbeatTimer = null;
+let lastActivityAt = Date.now();
+let peerLostNotified = false;
+
+// --- Callbacks ------------------------------------------------------------------
 let callbacks = {
     onStatusUpdate: () => {},
     onConnected: () => {},
     onDisconnected: () => {},
     onDataReceived: () => {},
-    onShareLinkGenerated: () => {}
+    onBinaryData: () => {},
+    onShareLinkGenerated: () => {},
+    onPeerName: () => {},
 };
 
 /**
- * Initialize connection manager
- * @param {object} options - Connection options
- * @param {function} options.onStatusUpdate - Status update callback
- * @param {function} options.onConnected - Connection established callback
- * @param {function} options.onDisconnected - Connection closed callback
- * @param {function} options.onDataReceived - Data received callback
- * @returns {object} Connection manager API
+ * Initialize connection manager.
+ * @param {object} options - callback bag (see above) plus optional deviceName
  */
-export function initializeConnectionManager(options) {
-    // Set callbacks
+export function initializeConnectionManager(options = {}) {
     callbacks = { ...callbacks, ...options };
-    
     return {
         connect,
         sendMessage,
-        isConnected: () => !!connection,
+        sendBinary,
+        isConnected: () => connected,
         isHost: () => isHost,
         getPeerId: () => peerId,
-        getConnection: () => connection
+        getPeer: () => peer,
     };
 }
 
-/**
- * Connect to signaling server and set up peer connection
- */
-function connect() {
-    callbacks.onStatusUpdate('Initializing...', false);
-    connectToSignalingServer();
+// --- Signaling --------------------------------------------------------------------
+export function connect() {
+    callbacks.onStatusUpdate('Connecting to server...', false);
+    hostIdFromUrl = readHostParam();
+    openSocket();
 }
 
-/**
- * Connect to WebSocket signaling server
- */
-function connectToSignalingServer() {
-    // Use the current host and port for WebSocket connection
+function readHostParam() {
+    const urlParams = new URLSearchParams(window.location.search);
+    return urlParams.get('host') || null;
+}
+
+function openSocket() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}`;
-    
-    console.log('Connecting to WebSocket server:', wsUrl);
-    ws = new WebSocket(wsUrl);
-    
-    ws.onopen = () => {
-        console.log('Connected to signaling server');
-        
-        // Generate a random peer ID
-        peerId = generateId();
-        console.log('Generated peer ID:', peerId);
-        
-        // Register with signaling server
-        ws.send(JSON.stringify({
-            type: 'register',
-            peerId: peerId
-        }));
-        
-        // Determine if we're host or client
-        const urlParams = new URLSearchParams(window.location.search);
-        const hostId = urlParams.get('host') || 
-                      (window.location.pathname.startsWith('/host=') ? 
-                       window.location.pathname.substring(6) : null);
-        
-        if (hostId) {
+    const socket = new WebSocket(wsUrl);
+    ws = socket;
+
+    socket.onopen = () => {
+        reconnectAttempts = 0;
+        lastActivityAt = Date.now();
+        peerLostNotified = false;
+
+        socket.send(JSON.stringify({ type: 'register', peerId }));
+
+        if (hostIdFromUrl) {
             isHost = false;
             callbacks.onStatusUpdate('Connecting to host...', false);
-            
-            // Join the host's room
-            ws.send(JSON.stringify({
-                type: 'join',
-                hostId: hostId
-            }));
+            sendJoin();
         } else {
             isHost = true;
-            callbacks.onStatusUpdate('Ready! Waiting for connections.', true);
-            
-            // Generate shareable link
             const shareUrl = `${window.location.origin}${window.location.pathname}?host=${peerId}`;
-            console.log('Share URL generated:', shareUrl);
-            
-            // Update UI with shareable link
+            callbacks.onStatusUpdate('Waiting for peer...', false);
             callbacks.onShareLinkGenerated(shareUrl);
         }
     };
-    
-    ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        console.log('Received WebSocket message:', data);
-        
-        switch (data.type) {
-            case 'registered':
-                console.log('Successfully registered with signaling server');
-                break;
-                
-            case 'join-sent':
-                console.log('Join request sent to host:', data.hostId);
-                callbacks.onStatusUpdate('Establishing connection...', false);
-                break;
-                
-            case 'client-joined':
-                console.log('Client joined:', data.clientId);
-                remotePeerId = data.clientId;
-                createPeerConnection(data.clientId, true);
-                break;
-                
-            case 'offer':
-                console.log('Received offer from:', data.sender);
-                remotePeerId = data.sender;
-                handleOffer(data.sender, data.offer);
-                break;
-                
-            case 'answer':
-                console.log('Received answer from:', data.sender);
-                handleAnswer(data.sender, data.answer);
-                break;
-                
-            case 'ice-candidate':
-                console.log('Received ICE candidate from:', data.sender);
-                handleIceCandidate(data.sender, data.candidate);
-                break;
-                
-            case 'client-left':
-                console.log('Client left:', data.clientId);
-                if (peer && remotePeerId === data.clientId) {
-                    callbacks.onStatusUpdate('Peer disconnected', false);
-                    if (peer) {
-                        peer.destroy();
-                        peer = null;
-                    }
-                    connection = null;
-                    callbacks.onDisconnected();
-                }
-                break;
-                
-            case 'host-left':
-                console.log('Host left:', data.hostId);
-                callbacks.onStatusUpdate('Host disconnected', false);
-                if (peer) {
-                    peer.destroy();
-                    peer = null;
-                }
-                connection = null;
-                callbacks.onDisconnected();
-                break;
-                
-            case 'error':
-                console.error('Signaling server error:', data.message);
-                callbacks.onStatusUpdate(`Signaling error: ${data.message}`, false);
-                break;
-        }
+
+    socket.onmessage = (event) => {
+        if (ws !== socket) return;
+        lastActivityAt = Date.now();
+        let data;
+        try { data = JSON.parse(event.data); } catch { return; }
+        handleSignalingMessage(data);
     };
-    
-    ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        callbacks.onStatusUpdate('Signaling server connection error', false);
-    };
-    
-    ws.onclose = () => {
-        console.log('Disconnected from signaling server');
-        callbacks.onStatusUpdate('Disconnected from signaling server', false);
-        setTimeout(connectToSignalingServer, 5000);
+
+    socket.onerror = () => { /* onclose follows */ };
+
+    socket.onclose = () => {
+        if (ws !== socket) return;
+        stopHeartbeat();
+        clearJoinRetry();
+        teardownPeer('signaling lost');
+        callbacks.onStatusUpdate(isHost ? 'Reconnecting to server...' : 'Server connection lost, retrying...', false);
+        scheduleReconnect();
     };
 }
 
-/**
- * Create a WebRTC peer connection
- * @param {string} remotePeerId - Remote peer ID
- * @param {boolean} isInitiator - Whether we're initiating the connection
- * @returns {RTCPeerConnection} Peer connection
- */
-function createPeerConnection(remotePeerId, isInitiator) {
+function sendJoin() {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !hostIdFromUrl) return;
+    ws.send(JSON.stringify({ type: 'join', hostId: hostIdFromUrl, peerId }));
+}
+
+function scheduleJoinRetry() {
+    if (isHost || connected || joinRetryTimer) return;
+    joinRetryTimer = setTimeout(() => {
+        joinRetryTimer = null;
+        if (!connected) sendJoin();
+    }, 2000);
+}
+
+function clearJoinRetry() {
+    if (joinRetryTimer) {
+        clearTimeout(joinRetryTimer);
+        joinRetryTimer = null;
+    }
+}
+
+function scheduleReconnect() {
+    if (reconnectTimer) return;
+    const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttempts);
+    reconnectAttempts++;
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        openSocket();
+    }, delay);
+}
+
+function handleSignalingMessage(data) {
+    switch (data.type) {
+        case 'registered':
+            break;
+
+        case 'join-sent':
+            callbacks.onStatusUpdate('Establishing connection...', false);
+            break;
+
+        case 'client-joined':
+            remotePeerId = data.clientId;
+            createPeerConnection(data.clientId, true);
+            break;
+
+        case 'offer':
+            if (remotePeerId !== data.sender) {
+                // A different peer is offering — replace the current one.
+                teardownPeer('replaced');
+                remotePeerId = data.sender;
+            }
+            handleOffer(data.sender, data.offer);
+            break;
+
+        case 'answer':
+            if (peer && peer.remotePeerId === data.sender) {
+                peer.signal(data.answer);
+            }
+            break;
+
+        case 'ice-candidate':
+            if (peer && peer.remotePeerId === data.sender) {
+                peer.signal({ candidate: data.candidate });
+            }
+            break;
+
+        case 'client-left':
+            if (remotePeerId === data.clientId) {
+                teardownPeer('peer left');
+                if (isHost) callbacks.onStatusUpdate('Waiting for peer...', false);
+            }
+            break;
+
+        case 'host-left':
+            callbacks.onStatusUpdate('Host disconnected, retrying...', false);
+            teardownPeer('host left');
+            scheduleJoinRetry();
+            break;
+
+        case 'error':
+            console.error('Signaling server error:', data.message);
+            callbacks.onStatusUpdate(`Server: ${data.message}`, false);
+            if (!isHost && /host not found/i.test(data.message || '')) scheduleJoinRetry();
+            break;
+    }
+}
+
+// --- WebRTC ------------------------------------------------------------------------
+function createPeerConnection(remoteId, isInitiator) {
+    if (peer && peer.remotePeerId !== remoteId) teardownPeer('replaced');
+    if (peer) return peer; // already talking to this peer
+
     try {
-        const peerOptions = {
+        const options = {
             initiator: isInitiator,
             trickle: true,
             config: {
                 iceServers: [
                     { urls: 'stun:stun.l.google.com:19302' },
-                    { urls: 'stun:stun1.l.google.com:19302' },
-                    { urls: 'stun:stun2.l.google.com:19302' },
-                    { urls: 'stun:stun3.l.google.com:19302' },
-                    { urls: 'stun:stun4.l.google.com:19302' },
-                    { urls: 'stun:global.stun.twilio.com:3478' }
-                ]
-            }
+                    { urls: 'stun:global.stun.twilio.com:3478' },
+                ],
+            },
         };
 
-        peer = new SimplePeer(peerOptions);
-        peer.remotePeerId = remotePeerId;
-        console.log('Peer created with options:', peerOptions);
-        
+        peer = new SimplePeer(options);
+        peer.remotePeerId = remoteId;
         setupPeerEvents();
         return peer;
     } catch (err) {
         console.error('Error creating peer connection:', err);
-        callbacks.onStatusUpdate('Error creating connection: ' + err.message, false);
+        callbacks.onStatusUpdate('Connection error: ' + err.message, false);
         return null;
     }
 }
 
-/**
- * Handle WebRTC offer
- * @param {string} senderId - Sender's peer ID
- * @param {object} offer - WebRTC offer
- */
 function handleOffer(senderId, offer) {
     try {
-        if (!peer) {
-            peer = createPeerConnection(senderId, false);
-            if (!peer) return;
-        }
-        peer.signal(offer);
+        if (!peer || peer.remotePeerId !== senderId) createPeerConnection(senderId, false);
+        if (peer) peer.signal(offer);
     } catch (err) {
         console.error('Error handling offer:', err);
-        callbacks.onStatusUpdate('Error handling offer: ' + err.message, false);
+        callbacks.onStatusUpdate('Connection error: ' + err.message, false);
     }
 }
 
-/**
- * Handle WebRTC answer
- * @param {string} senderId - Sender's peer ID
- * @param {object} answer - WebRTC answer
- */
-function handleAnswer(senderId, answer) {
-    try {
-        if (peer && peer.remotePeerId === senderId) {
-            peer.signal(answer);
-        } else {
-            console.error('Received answer from unknown peer:', senderId);
-        }
-    } catch (err) {
-        console.error('Error handling answer:', err);
-        callbacks.onStatusUpdate('Error handling answer: ' + err.message, false);
+function teardownPeer(reason) {
+    stopHeartbeat();
+    const wasConnected = connected;
+    connected = false;
+    if (peer) {
+        const dying = peer;
+        peer = null;
+        try { dying.destroy(); } catch { /* ignore */ }
+    }
+    remotePeerId = null;
+
+    if (wasConnected && !peerLostNotified) {
+        peerLostNotified = true;
+        callbacks.onDisconnected(reason || 'disconnected');
     }
 }
 
-/**
- * Handle ICE candidate
- * @param {string} senderId - Sender's peer ID
- * @param {object} candidate - ICE candidate
- */
-function handleIceCandidate(senderId, candidate) {
-    try {
-        if (peer && peer.remotePeerId === senderId) {
-            peer.signal({ candidate: candidate });
-        } else {
-            console.error('Received ICE candidate from unknown peer:', senderId);
-        }
-    } catch (err) {
-        console.error('Error handling ICE candidate:', err);
-    }
-}
-
-/**
- * Set up WebRTC peer events
- */
 function setupPeerEvents() {
-    console.log('Setting up peer events for peer:', peer);
-    
     peer.on('signal', (data) => {
-        console.log('Generated signal data', data);
-        
+        lastActivityAt = Date.now();
+        if (!peer || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const base = { sender: peerId, target: peer.remotePeerId };
         if (data.type === 'offer') {
-            console.log('Sending offer to remote peer');
-            ws.send(JSON.stringify({
-                type: 'offer',
-                sender: peerId,
-                target: peer.remotePeerId,
-                offer: data
-            }));
+            ws.send(JSON.stringify({ ...base, type: 'offer', offer: data }));
         } else if (data.type === 'answer') {
-            console.log('Sending answer to remote peer');
-            ws.send(JSON.stringify({
-                type: 'answer',
-                sender: peerId,
-                target: peer.remotePeerId,
-                answer: data
-            }));
+            ws.send(JSON.stringify({ ...base, type: 'answer', answer: data }));
         } else if (data.candidate) {
-            console.log('Sending ICE candidate to remote peer');
-            ws.send(JSON.stringify({
-                type: 'ice-candidate',
-                sender: peerId,
-                target: peer.remotePeerId,
-                candidate: data.candidate
-            }));
+            ws.send(JSON.stringify({ ...base, type: 'ice-candidate', candidate: data.candidate }));
         }
     });
 
     peer.on('connect', () => {
-        console.log('Peer connection established!');
+        connected = true;
+        clearJoinRetry();
+        lastActivityAt = Date.now();
+        peerLostNotified = false;
         callbacks.onStatusUpdate('Connected to peer!', true);
-        
-        // Set connection first
-        connection = peer;
-        console.log('Connection variable set:', !!connection);
-        
-        // Then send greeting message
-        sendMessage({
-            type: 'greeting',
-            message: 'Hello from FileSender!'
-        });
-        
+        startHeartbeat();
+
+        // Greeting carries our display name.
+        sendMessage({ type: 'greeting', name: getDeviceName() });
         callbacks.onConnected();
     });
 
     peer.on('data', (data) => {
-        console.log('Received data from peer:', {
-            type: typeof data,
-            constructor: data?.constructor?.name,
-            size: data.byteLength || data.length,
-            isString: typeof data === 'string',
-            isArrayBuffer: data instanceof ArrayBuffer,
-            isUint8Array: data instanceof Uint8Array
-        });
-
-        // Handle different types of data
+        lastActivityAt = Date.now();
+        // simple-peer pushes both strings and binary through a byte stream, so
+        // JSON control messages often arrive as Uint8Array. File frames are the
+        // only payloads that start with the FS2P magic.
         if (typeof data === 'string') {
-            // String data - pass it directly to the callback
-            // The callback will handle JSON parsing
-            callbacks.onDataReceived(data);
-        } else if (data instanceof ArrayBuffer || data instanceof Uint8Array) {
-            // Binary data - convert to string
-            try {
-                // Convert binary data to string
-                const decoder = new TextDecoder('utf-8');
-                const dataString = decoder.decode(data instanceof ArrayBuffer ? data : data.buffer);
-                console.log('Successfully converted binary data to string');
-                
-                // Pass the string to the callback
-                // The callback will handle JSON parsing
-                callbacks.onDataReceived(dataString);
-            } catch (err) {
-                console.error('Error converting binary data to string:', err);
-            }
-        } else {
-            console.warn('Received unsupported data type (this should not happen):', data);
+            handleControlText(data);
+            return;
         }
+        const bytes = toBytes(data);
+        if (!bytes) return;
+        if (isFileFrame(bytes)) callbacks.onBinaryData(bytes);
+        else handleControlText(new TextDecoder().decode(bytes));
     });
 
     peer.on('error', (err) => {
         console.error('Peer connection error:', err);
-        callbacks.onStatusUpdate(`Connection error: ${err.message}`, false);
+        if (!connected) {
+            callbacks.onStatusUpdate(isHost ? 'Waiting for peer...' : 'Connection failed — try again', false);
+        } else {
+            callbacks.onStatusUpdate('Connection error', false);
+        }
     });
 
-    peer.on('close', () => {
-        console.log('Peer connection closed');
-        callbacks.onStatusUpdate('Connection closed', false);
-        connection = null;
-        callbacks.onDisconnected();
-    });
-    
-    console.log('Peer events setup complete');
+    peer.on('close', () => teardownPeer('closed'));
 }
 
-/**
- * Send a message to the connected peer
- * @param {object} message - Message to send
- * @returns {boolean} Whether the message was sent
- */
-export function sendMessage(message) {
-    if (!connection) {
-        console.error('Cannot send message: No connection');
-        return false;
+// --- Heartbeat ------------------------------------------------------------------------
+function toBytes(data) {
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    return null;
+}
+
+function isFileFrame(bytes) {
+    return bytes.length >= 4 && bytes[0] === 0x46 && bytes[1] === 0x53 && bytes[2] === 0x32 && bytes[3] === 0x50;
+}
+
+function handleControlText(text) {
+    let message;
+    try { message = JSON.parse(text); } catch { return; }
+    if (message.type === 'greeting' && message.name) {
+        callbacks.onPeerName(message.name);
+    } else if (message.type !== 'ping' && message.type !== 'pong') {
+        callbacks.onDataReceived(JSON.stringify(message));
     }
-    
+}
+
+function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(() => {
+        if (!connected) return;
+        const idleMs = Date.now() - lastActivityAt;
+        if (idleMs > PEER_TIMEOUT_MS) {
+            callbacks.onStatusUpdate('Peer lost — waiting for them to return...', false);
+            teardownPeer('peer-lost');
+            return;
+        }
+        sendMessage({ type: 'ping', t: Date.now() });
+    }, HEARTBEAT_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+    if (heartbeatTimer) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+    }
+}
+
+// --- Sending ------------------------------------------------------------------------
+export function sendMessage(message) {
+    if (!connected || !peer) return false;
     try {
-        const serializedMessage = JSON.stringify(message);
-        connection.send(serializedMessage);
+        peer.send(JSON.stringify(message));
+        lastActivityAt = Date.now();
         return true;
     } catch (err) {
         console.error('Error sending message:', err);
         return false;
     }
+}
+
+/** Send a raw binary frame (ArrayBuffer/Uint8Array/Blob). */
+export function sendBinary(data) {
+    if (!connected || !peer) return false;
+    try {
+        peer.send(data);
+        lastActivityAt = Date.now();
+        return true;
+    } catch (err) {
+        console.error('Error sending binary frame:', err);
+        return false;
+    }
+}
+
+// --- Device name ------------------------------------------------------------------------
+function getDeviceName() {
+    try {
+        const stored = localStorage.getItem('fs2p-device-name');
+        if (stored) return stored;
+    } catch { /* private mode */ }
+    // Simple heuristic default.
+    const ua = navigator.userAgent || '';
+    let device = 'Browser';
+    if (/iPhone|iPad|iPod/i.test(ua)) device = 'iOS Device';
+    else if (/Android/i.test(ua)) device = 'Android Device';
+    else if (/Macintosh/i.test(ua)) device = 'Mac';
+    else if (/Windows/i.test(ua)) device = 'PC (Windows)';
+    else if (/Linux/i.test(ua)) device = 'PC (Linux)';
+    return device;
 }

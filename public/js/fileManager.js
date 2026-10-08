@@ -1,265 +1,190 @@
 /**
- * File Manager for FileSender P2P
- * Handles file operations, tracking, and history
+ * File Manager v2 for FileSender P2P
+ *
+ * Lightweight bookkeeping layer on top of the transfer manager:
+ *  - Tracks per-file UI state (status / progress / error / verified).
+ *  - Owns received blobs + object URLs, auto-download behavior, and history.
+ *  - Persists user settings (auto-download, device name) in localStorage.
  */
+
 import { formatBytes } from './utils.js';
 
-// File tracking
-const filesToSend = {};
-const receivedFiles = {};
-const AUTO_DOWNLOAD_ENABLED = true;
-const MAX_FILES_TO_KEEP = 5;
-const fileHistory = {
-    sent: [],
-    received: []
-};
+const MAX_RECEIVED_KEPT = 10; // completed received files kept in memory this session
 
-// Event callbacks
+// --- State --------------------------------------------------------------------
+/** @type {Map<string, object>} fileId -> send-side record (UI state only) */
+const sentFiles = new Map();
+/** @type {Map<string, object>} fileId -> receive-side record incl. blob/url */
+const receivedFiles = new Map();
+
 let callbacks = {
     onFileAdded: () => {},
     onFileStatusUpdate: () => {},
-    onFileComplete: () => {}
+    onFileComplete: () => {},
 };
 
-/**
- * Initialize file manager
- * @param {object} options - File manager options
- * @param {function} options.onFileAdded - File added callback
- * @param {function} options.onFileStatusUpdate - File status update callback
- * @param {function} options.onFileComplete - File complete callback
- * @returns {object} File manager API
- */
-export function initializeFileManager(options) {
-    // Set callbacks
-    callbacks = { ...callbacks, ...options };
-    
+// --- Settings -------------------------------------------------------------------
+export function getSettings() {
     return {
-        addFileToSend,
-        getFileToSend,
-        getAllFilesToSend,
+        autoDownload: getSetting('fs2p-auto-download', '1') === '1',
+        deviceName: localStorage.getItem('fs2p-device-name') || '',
+    };
+}
+
+function getSetting(key, fallback) {
+    try {
+        const v = localStorage.getItem(key);
+        return v !== null ? v : fallback;
+    } catch {
+        return fallback;
+    }
+}
+
+export function setAutoDownload(enabled) {
+    try { localStorage.setItem('fs2p-auto-download', enabled ? '1' : '0'); } catch { /* ignore */ }
+}
+
+export function setDeviceName(name) {
+    const trimmed = (name || '').trim().slice(0, 40);
+    try {
+        if (trimmed) localStorage.setItem('fs2p-device-name', trimmed);
+        else localStorage.removeItem('fs2p-device-name');
+    } catch { /* ignore */ }
+}
+
+// --- Initialization ---------------------------------------------------------------
+/**
+ * Initialize file manager.
+ * @param {object} options - onFileAdded(fileId, record, direction),
+ *                           onFileStatusUpdate(fileId, direction, state),
+ *                           onFileComplete(fileId, direction, record)
+ */
+export function initializeFileManager(options = {}) {
+    callbacks = { ...callbacks, ...options };
+    return {
+        registerSendFile,
+        getSendRecord: (fileId) => sentFiles.get(fileId),
         addReceivedFile,
-        getReceivedFile,
-        getAllReceivedFiles,
+        getReceivedRecord: (fileId) => receivedFiles.get(fileId),
         updateFileStatus,
-        completeFile,
-        maintainFileLimit
+        completeReceivedFile,
+        removeFile,
+        clearCompleted,
     };
 }
 
-/**
- * Add a file to be sent
- * @param {File} file - File object
- * @returns {string} File ID
- */
-function addFileToSend(file) {
-    const fileId = `file-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    
-    filesToSend[fileId] = {
+// --- Send side ----------------------------------------------------------------------
+/** Register a file that the transfer manager will send. */
+export function registerSendFile(fileId, { name, size, type }) {
+    sentFiles.set(fileId, {
         id: fileId,
-        file: file,
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        status: 'pending',
+        direction: 'send',
+        name,
+        size,
+        type: type || 'application/octet-stream',
+        status: 'queued',
         progress: 0,
-        chunks: Math.ceil(file.size / (64 * 1024)), // 64KB chunks
-        sentChunks: 0,
-        acknowledgedChunks: 0 // Track acknowledged chunks
-    };
-    
-    callbacks.onFileAdded(fileId, file, 'send');
-    
-    // Add to history
-    fileHistory.sent.push({
-        id: fileId,
-        name: file.name,
-        size: file.size,
-        timestamp: Date.now()
+        error: null,
+        verified: undefined,
     });
-    
-    return fileId;
+    callbacks.onFileAdded(fileId, sentFiles.get(fileId), 'send');
 }
 
-/**
- * Get a file to send by ID
- * @param {string} fileId - File ID
- * @returns {object} File info
- */
-function getFileToSend(fileId) {
-    return filesToSend[fileId];
-}
-
-/**
- * Get all files to send
- * @returns {object} Files to send
- */
-function getAllFilesToSend() {
-    return filesToSend;
-}
-
-/**
- * Add a received file
- * @param {string} fileId - File ID
- * @param {object} fileInfo - File info
- * @returns {object} File info
- */
-function addReceivedFile(fileId, fileInfo) {
-    receivedFiles[fileId] = {
+// --- Receive side ---------------------------------------------------------------------
+/** Register an incoming file announced by metadata. */
+export function addReceivedFile(fileId, { name, size, type }) {
+    receivedFiles.set(fileId, {
         id: fileId,
-        name: fileInfo.name,
-        size: fileInfo.size,
-        type: fileInfo.type,
+        direction: 'receive',
+        name,
+        size,
+        type: type || 'application/octet-stream',
         status: 'receiving',
         progress: 0,
-        chunks: fileInfo.chunks,
-        receivedChunks: 0,
-        buffer: new Map(), // Store chunks in a Map
-        completed: false
-    };
-    
-    callbacks.onFileAdded(fileId, fileInfo, 'receive');
-    
-    // Add to history
-    fileHistory.received.push({
-        id: fileId,
-        name: fileInfo.name,
-        size: fileInfo.size,
-        timestamp: Date.now()
+        error: null,
+        verified: undefined,
+        blob: null,
+        url: null,
     });
-    
-    return receivedFiles[fileId];
+    callbacks.onFileAdded(fileId, receivedFiles.get(fileId), 'receive');
 }
 
+// --- Status updates ---------------------------------------------------------------------
 /**
- * Get a received file by ID
- * @param {string} fileId - File ID
- * @returns {object} File info
+ * Apply a status update from the transfer manager.
+ * @param {string} fileId
+ * @param {'send'|'receive'} direction
+ * @param {{status?: string, progress?: number, error?: string|null, verified?: boolean}} updates
  */
-function getReceivedFile(fileId) {
-    return receivedFiles[fileId];
+export function updateFileStatus(fileId, direction, updates = {}) {
+    const record = (direction === 'send' ? sentFiles : receivedFiles).get(fileId);
+    if (!record) return;
+
+    if (updates.status !== undefined) record.status = updates.status;
+    if (updates.progress !== undefined) record.progress = updates.progress;
+    if (updates.error !== undefined) record.error = updates.error || null;
+    if ('verified' in updates && updates.verified !== undefined) record.verified = updates.verified;
+
+    callbacks.onFileStatusUpdate(fileId, direction, { ...record });
 }
 
+// --- Completion ---------------------------------------------------------------------
 /**
- * Get all received files
- * @returns {object} Received files
+ * Called by the transfer manager when a received file is fully assembled.
+ * @param {string} fileId
+ * @param {Blob} blob
  */
-function getAllReceivedFiles() {
-    return receivedFiles;
-}
+export function completeReceivedFile(fileId, blob) {
+    const record = receivedFiles.get(fileId);
+    if (!record) return;
 
-/**
- * Update file status
- * @param {string} fileId - File ID
- * @param {string} type - 'send' or 'receive'
- * @param {object} updates - Status updates
- */
-function updateFileStatus(fileId, type, updates) {
-    const files = type === 'send' ? filesToSend : receivedFiles;
-    const file = files[fileId];
-    
-    if (!file) return;
-    
-    // Update file properties
-    Object.assign(file, updates);
-    
-    // Calculate progress
-    if (type === 'send') {
-        file.progress = Math.floor((file.sentChunks / file.chunks) * 100);
-    } else {
-        file.progress = Math.floor((file.receivedChunks / file.chunks) * 100);
+    record.blob = blob;
+    record.url = URL.createObjectURL(blob);
+
+    callbacks.onFileComplete(fileId, 'receive', { ...record });
+
+    if (getSettings().autoDownload && record.url && record.verified !== false) {
+        setTimeout(() => triggerDownload(record.url, record.name), 150);
     }
-    
-    // Notify about status update
-    callbacks.onFileStatusUpdate(fileId, type, file.status, file.progress);
+
+    maintainReceivedLimit();
 }
 
-/**
- * Mark a file as complete
- * @param {string} fileId - File ID
- * @param {string} type - 'send' or 'receive'
- * @param {object} options - Additional options
- */
-function completeFile(fileId, type, options = {}) {
-    const files = type === 'send' ? filesToSend : receivedFiles;
-    const file = files[fileId];
-    
-    if (!file) return;
-    
-    // Update file status
-    file.status = 'complete';
-    file.progress = 100;
-    
-    if (type === 'receive' && options.blob) {
-        file.blob = options.blob;
-        file.url = URL.createObjectURL(options.blob);
-        
-        console.log(`File ${fileId} completed:`, {
-            name: file.name,
-            size: file.blob.size,
-            type: file.blob.type,
-            url: file.url
-        });
-    }
-    
-    // Notify about completion
-    callbacks.onFileComplete(fileId, type, file);
-    
-    // Auto download if enabled (with a small delay to ensure blob is ready)
-    if (type === 'receive' && AUTO_DOWNLOAD_ENABLED && file.url) {
-        setTimeout(() => {
-            triggerFileDownload(file.url, file.name);
-        }, 100);
-    }
-    
-    // Maintain file limit
-    maintainFileLimit(type);
-}
-
-/**
- * Maintain file limit (remove old files)
- * @param {string} type - 'send' or 'receive'
- */
-function maintainFileLimit(type) {
-    const history = type === 'send' ? fileHistory.sent : fileHistory.received;
-    const files = type === 'send' ? filesToSend : receivedFiles;
-    
-    // If we have more than MAX_FILES_TO_KEEP, remove the oldest ones
-    if (history.length > MAX_FILES_TO_KEEP) {
-        // Sort by timestamp (oldest first)
-        history.sort((a, b) => a.timestamp - b.timestamp);
-        
-        // Remove oldest files until we're at the limit
-        while (history.length > MAX_FILES_TO_KEEP) {
-            const oldestFile = history.shift();
-            
-            // Clean up file data
-            if (files[oldestFile.id]) {
-                // Revoke object URL if it exists
-                if (files[oldestFile.id].url) {
-                    URL.revokeObjectURL(files[oldestFile.id].url);
-                }
-                
-                // Delete file data
-                delete files[oldestFile.id];
-            }
-        }
+function maintainReceivedLimit() {
+    const completed = [...receivedFiles.values()]
+        .filter(r => r.status === 'complete')
+        .sort((a, b) => (a.id < b.id ? -1 : 1)); // insertion order approximates time
+    while (completed.length > MAX_RECEIVED_KEPT) {
+        const oldest = completed.shift();
+        if (oldest.url) URL.revokeObjectURL(oldest.url);
+        receivedFiles.delete(oldest.id);
     }
 }
 
-/**
- * Trigger file download
- * @param {string} url - File URL
- * @param {string} fileName - File name
- */
-function triggerFileDownload(url, fileName) {
+// --- Housekeeping ---------------------------------------------------------------------
+export function removeFile(fileId, direction) {
+    const map = direction === 'send' ? sentFiles : receivedFiles;
+    const record = map.get(fileId);
+    if (!record) return;
+    if (record.url) URL.revokeObjectURL(record.url);
+    map.delete(fileId);
+}
+
+export function clearCompleted() {
+    for (const [id, r] of [...receivedFiles.entries()]) {
+        if (r.status === 'complete') removeFile(id, 'receive');
+    }
+    for (const [id, r] of [...sentFiles.entries()]) {
+        if (['complete', 'cancelled'].includes(r.status)) sentFiles.delete(id);
+    }
+}
+
+// --- Download helper ---------------------------------------------------------------------
+export function triggerDownload(url, fileName) {
     const a = document.createElement('a');
     a.href = url;
-    a.download = fileName;
+    a.download = fileName || 'download';
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    
-    // Don't revoke the URL immediately - let it persist for manual downloads
-    // The URL will be cleaned up when the file is removed from history
-    console.log(`Download triggered for: ${fileName}`);
 }

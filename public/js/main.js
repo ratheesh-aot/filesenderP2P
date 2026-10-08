@@ -1,213 +1,214 @@
 /**
- * Main entry point for FileSender P2P
- * Imports and initializes all modules
+ * Main entry point for FileSender P2P v2
+ * Wires the UI, signaling, and transfer pipeline together.
  */
-import { initializeUI, updateStatus, setupUIEvents, ensureTabsInitialized, addFileToUI, generateQRCode } from './uiManager.js';
+
+import { initializeUI, setStatus, showShareCard, setClientConnectedText, addFileRow, updateFileRow, updateStats, showToast, initSettingsDrawer, generateQRCode, removeFileRow } from './uiManager.js';
 import { initializeConnectionManager } from './connectionManager.js';
-import { initializeFileManager } from './fileManager.js';
-import { initializeTransferManager, handleFiles, handleMessage } from './transferManager.js';
+import { initializeFileManager, getSettings, setAutoDownload, setDeviceName } from './fileManager.js';
+import { initializeTransferManager } from './transferManager.js';
+import { formatBytes } from './utils.js';
 
-// Initialize the application when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
-    console.log('DOM Content Loaded - Starting FileSender P2P initialization');
+    console.log('[FileSender P2P v2] Starting initialization…');
 
-    // Initialize UI
     const ui = initializeUI();
-    
-    // Debug UI elements
-    console.log('UI elements:', {
-        hostInfoEl: ui.hostInfoEl ? true : false,
-        clientInfoEl: ui.clientInfoEl ? true : false,
-        shareLinkInput: ui.shareLinkInput ? true : false
-    });
-    
-    // Initialize file manager
+    const { deviceName } = getSettings();
+    if (deviceName) setDeviceName(deviceName);
+
     const fileManager = initializeFileManager({
-        onFileAdded: (fileId, file, type) => {
-            console.log(`File added: ${fileId}, type: ${type}`);
-            // Add file to UI
-            const listElement = type === 'send' ? ui.filesToSendList : ui.receivedFilesList;
-            addFileToUI(listElement, fileId, file.name, file.size, type === 'send' ? 'pending' : 'receiving');
+        onFileAdded: (fileId, record, direction) => {
+            addFileRow(fileId, direction, record);
         },
-        onFileStatusUpdate: (fileId, type, status, progress) => {
-            const listElement = type === 'send' ? ui.filesToSendList : ui.receivedFilesList;
-            updateFileStatus(listElement, fileId, status, progress);
+        onFileStatusUpdate: (fileId, direction, state) => {
+            updateFileRow(fileId, direction, state);
         },
-        onFileComplete: (fileId, type, file) => {
-            console.log(`File complete: ${fileId}, type: ${type}`);
-            const listElement = type === 'send' ? ui.filesToSendList : ui.receivedFilesList;
-            
-            if (type === 'receive' && file.url) {
-                updateFileStatus(listElement, fileId, 'complete', 100, file.url, file.name);
-            } else {
-                updateFileStatus(listElement, fileId, 'complete', 100);
-            }
-        }
     });
-    
-    // Initialize connection manager first
+
+    let transferManager = null;
+    let announcedLink = false;
+    const isClient = () => new URLSearchParams(window.location.search).has('host');
+
     const connectionManager = initializeConnectionManager({
-        onStatusUpdate: (message, isConnected) => {
-            updateStatus(message, isConnected);
-            if (isConnected) {
-                // Show/hide appropriate UI elements based on whether we're host or client
-                const urlParams = new URLSearchParams(window.location.search);
-                const hostId = urlParams.get('host');
-                
-                if (hostId) {
-                    // Client mode
-                    if (ui.hostInfoEl) ui.hostInfoEl.style.display = 'none';
-                    if (ui.clientInfoEl) {
-                        ui.clientInfoEl.style.display = 'block';
-                        // Update client info text when connected
-                        ui.clientInfoEl.innerHTML = '<p>Connected to host!</p>';
-                    }
-                } else {
-                    // Host mode
-                    if (ui.hostInfoEl) ui.hostInfoEl.style.display = 'block';
-                    if (ui.clientInfoEl) ui.clientInfoEl.style.display = 'none';
-                }
-            }
-        },
-        onShareLinkGenerated: (shareUrl) => {
-            console.log('Share link generated:', shareUrl);
-            if (ui.shareLinkInput) {
-                ui.shareLinkInput.value = shareUrl;
-            }
-            if (ui.hostInfoEl) {
-                ui.hostInfoEl.style.display = 'block';
-            }
-            generateQRCode(shareUrl);
+        onStatusUpdate: (message, connected) => {
+            const state = connected
+                ? 'connected'
+                : /connect|wait|establish|retry|rejoin|lost/i.test(message)
+                    ? 'connecting'
+                    : 'error';
+            setStatus(message, state);
+            if (!isClient()) showShareCard();
         },
         onConnected: () => {
-            console.log('Connected to peer');
-            // Process any pending transfers
-            transferManager.processTransferQueue();
+            transferManager?.processTransferQueue();
         },
-        onDisconnected: () => {
-            console.log('Disconnected from peer');
+        onDisconnected: (reason) => {
+            showToast(`Connection lost (${reason})`, 'info');
         },
-        onDataReceived: (data) => {
-            try {
-                const message = JSON.parse(data);
-                console.log('Received message:', message);
-                handleMessage(message);
-            } catch (err) {
-                console.error('Error parsing message:', err);
+        onPeerName: (name) => {
+            if (isClient()) setClientConnectedText(name);
+            showToast(`Connected to ${name}`, 'success');
+        },
+        onDataReceived: (raw) => {
+            let message;
+            try { message = JSON.parse(raw); } catch { return; }
+            transferManager?.handleMessage(message);
+        },
+        onBinaryData: (data) => {
+            transferManager?.handleBinaryFrame(data);
+        },
+        onShareLinkGenerated: (shareUrl) => {
+            if (ui.shareLinkInput) ui.shareLinkInput.value = shareUrl;
+            showShareCard();
+            generateQRCode(shareUrl);
+            if (!announcedLink) {
+                announcedLink = true;
+                showToast('Share link is ready', 'success');
             }
-        }
+        },
     });
-    
-    // Initialize transfer manager after connectionManager
-    const transferManager = initializeTransferManager({
+
+    transferManager = initializeTransferManager({
         fileManager,
         connectionManager,
-        onTransferStart: (fileId) => {
-            console.log(`Transfer started: ${fileId}`);
+        onStats: (fileId, _direction, stats) => {
+            updateStats(fileId, stats);
         },
-        onTransferProgress: (fileId, progress) => {
-            console.log(`Transfer progress: ${fileId}, ${progress}%`);
+        onIncoming: (_fileId, meta) => {
+            showToast(`Incoming file: ${meta.name} (${formatBytes(meta.size)})`, 'info');
         },
-        onTransferComplete: (fileId) => {
-            console.log(`Transfer complete: ${fileId}`);
-        },
-        onTransferError: (fileId, error) => {
-            console.error(`Transfer error: ${fileId}`, error);
-        },
-        onChunkReceived: (fileId, chunkIndex, totalChunks) => {
-            console.log(`Chunk received: ${fileId}, ${chunkIndex}/${totalChunks}`);
-        }
     });
-    
-    
-    // Set up UI events
-    setupUIEvents({
-        onFileSelect: (files) => {
-            handleFiles(files);
-        },
-        onFileDrop: (files) => {
-            handleFiles(files);
-        }
+
+    window.fs2p_refs = { connectionManager, transferManager, fileManager };
+
+    setupUIEvents(ui, connectionManager, transferManager, fileManager);
+    initSettingsDrawer({
+        onDeviceName: setDeviceName,
+        onAutoDownload: setAutoDownload,
     });
-    
-    // Listen for file retry events
-    document.addEventListener('file-retry', (event) => {
-        const { fileId } = event.detail;
-        transferManager.retryFile(fileId);
-    });
-    
-    // Connect to signaling server
-    connectionManager.connect();
-    
-    // Ensure tabs are initialized
-    ensureTabsInitialized();
-    
-    // Helper function to update file status in UI
-    function updateFileStatus(listElement, fileId, status, progress, downloadUrl = null, fileName = null) {
-        const fileElement = listElement.querySelector(`[data-file-id="${fileId}"]`);
-        if (!fileElement) return;
-        
-        // Update status text
-        const statusElement = fileElement.querySelector('.file-status');
-        if (statusElement) {
-            statusElement.textContent = status;
-        }
-        
-        // Update progress bar
-        const progressBar = fileElement.querySelector('.progress-bar');
-        if (progressBar) {
-            progressBar.style.width = `${progress}%`;
-        }
-        
-        // Show/hide progress bar based on status
-        const progressContainer = fileElement.querySelector('.progress-container');
-        if (progressContainer) {
-            if (status === 'complete' || status === 'error') {
-                progressContainer.style.display = 'none';
-            } else {
-                progressContainer.style.display = 'block';
-            }
-        }
-        
-        // Update actions
-        const actionsContainer = fileElement.querySelector('.file-actions');
-        if (actionsContainer) {
-            actionsContainer.innerHTML = '';
-            
-            if (status === 'complete' && downloadUrl) {
-                // Add download button
-                const downloadButton = document.createElement('button');
-                downloadButton.className = 'download-button';
-                downloadButton.innerHTML = '<i class="fas fa-download"></i>';
-                downloadButton.title = 'Download';
-                downloadButton.addEventListener('click', () => {
-                    const a = document.createElement('a');
-                    a.href = downloadUrl;
-                    a.download = fileName || 'download';
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                });
-                actionsContainer.appendChild(downloadButton);
-            }
-            
-            if (status === 'error') {
-                // Add retry button for sent files
-                if (listElement.id === 'files-to-send') {
-                    const retryButton = document.createElement('button');
-                    retryButton.className = 'retry-button';
-                    retryButton.innerHTML = '<i class="fas fa-redo"></i>';
-                    retryButton.title = 'Retry';
-                    retryButton.addEventListener('click', () => {
-                        // Dispatch custom event for retry
-                        const event = new CustomEvent('file-retry', { 
-                            detail: { fileId } 
-                        });
-                        document.dispatchEvent(event);
-                    });
-                    actionsContainer.appendChild(retryButton);
-                }
-            }
-        }
+
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+            navigator.serviceWorker.register('/sw.js').catch((err) => {
+                console.log('[PWA] Service worker not registered:', err.message);
+            });
+        });
     }
 });
+
+function setupUIEvents(ui, connectionManager, transferManager, fileManager) {
+    if (!ui || !ui.copyButton || !ui.shareLinkInput || !ui.dropZone) return;
+
+    ui.copyButton.addEventListener('click', () => {
+        const value = ui.shareLinkInput.value;
+        if (!value) return;
+        navigator.clipboard.writeText(value).then(() => {
+            showToast('Link copied to clipboard', 'success');
+            const original = ui.copyButton.innerHTML;
+            ui.copyButton.innerHTML = '<i class="fas fa-check"></i>';
+            setTimeout(() => { ui.copyButton.innerHTML = original; }, 2000);
+        }).catch(() => {
+            showToast('Failed to copy link', 'error');
+        });
+    });
+
+    const openPicker = () => {
+        if (ui.fileInput) ui.fileInput.click();
+    };
+
+    ui.dropZone.addEventListener('click', openPicker);
+    ui.dropZone.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            openPicker();
+        }
+    });
+
+    const processFileList = (fileList) => {
+        if (!fileList || fileList.length === 0) return;
+        if (!connectionManager.isConnected()) {
+            showToast('File queued — it will send when a peer connects', 'info');
+        }
+        transferManager.handleFiles(fileList);
+    };
+
+    ui.dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        ui.dropZone.classList.add('dragover');
+    });
+    ui.dropZone.addEventListener('dragleave', () => {
+        ui.dropZone.classList.remove('dragover');
+    });
+    ui.dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        ui.dropZone.classList.remove('dragover');
+        processFileList(e.dataTransfer.files);
+    });
+
+    if (ui.fileInput) {
+        ui.fileInput.addEventListener('change', (e) => {
+            processFileList(e.target.files);
+            e.target.value = '';
+        });
+    }
+
+    document.addEventListener('file-action', (e) => {
+        const { fileId, action } = e.detail || {};
+        if (!fileId || !action) return;
+        switch (action) {
+            case 'pause':
+                transferManager.pauseFile(fileId);
+                showToast('Transfer paused', 'info');
+                break;
+            case 'resume':
+                transferManager.resumeFile(fileId);
+                showToast('Transfer resumed', 'success');
+                break;
+            case 'cancel':
+                transferManager.cancelFile(fileId);
+                showToast('Transfer cancelled', 'info');
+                break;
+            case 'retry':
+            case 'resend':
+                transferManager.retryFile(fileId);
+                showToast(action === 'resend' ? 'Sending again…' : 'Retrying…', 'info');
+                break;
+            case 'download':
+                downloadReceived(fileManager, fileId);
+                break;
+            case 'remove': {
+                const direction = fileManager.getSendRecord(fileId) ? 'send' : 'receive';
+                fileManager.removeFile(fileId, direction);
+                removeFileRow(fileId);
+                break;
+            }
+            case 'decline':
+                if (connectionManager.isConnected()) {
+                    connectionManager.sendMessage({ type: 'file-cancelled', fileId });
+                }
+                transferManager.handleMessage({ type: 'file-cancelled', fileId });
+                fileManager.removeFile(fileId, 'receive');
+                removeFileRow(fileId);
+                showToast('Transfer declined', 'info');
+                break;
+            default:
+                break;
+        }
+    });
+
+    connectionManager.connect();
+}
+
+function downloadReceived(fileManager, fileId) {
+    const record = fileManager.getReceivedRecord(fileId);
+    if (!record || !record.url) {
+        showToast('File not available', 'error');
+        return;
+    }
+    const a = document.createElement('a');
+    a.href = record.url;
+    a.download = record.name || 'download';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+}

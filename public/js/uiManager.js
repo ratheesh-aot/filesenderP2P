@@ -1,442 +1,375 @@
 /**
- * UI Manager for FileSender P2P
- * Handles UI elements, events, and updates
+ * UI Manager v2 for FileSender P2P
+ * Renders the unified activity feed, status pills, toasts, theme, and settings.
  */
+
 import { formatBytes, getFileTypeIcon } from './utils.js';
 
-// DOM Elements
-let connectionStatusEl;
-let hostInfoEl;
-let clientInfoEl;
-let shareLinkInput;
-let copyButton;
-let qrCodeContainerEl;
-let dropZone;
-let fileInput;
-let filesToSendList;
-let receivedFilesList;
-let tabButtons;
-let tabContents;
+// --- DOM refs --------------------------------------------------------------------
+let els = {};
+let currentFilter = 'all';
 
-/**
- * Initialize UI elements
- */
+/** fileId -> live stats for speed/ETA display */
+const liveStats = new Map();
+
+const THEME_KEY = 'fs2p-theme'; // 'system' | 'light' | 'dark'
+
+// --- Init --------------------------------------------------------------------------
 export function initializeUI() {
-    // Get DOM elements
-    connectionStatusEl = document.getElementById('connection-status');
-    hostInfoEl = document.getElementById('host-info');
-    clientInfoEl = document.getElementById('client-info');
-    shareLinkInput = document.getElementById('share-link');
-    copyButton = document.getElementById('copy-button');
-    qrCodeContainerEl = document.getElementById('qrcode-container');
-    dropZone = document.getElementById('drop-zone');
-    fileInput = document.getElementById('file-input');
-    filesToSendList = document.getElementById('files-to-send');
-    receivedFilesList = document.getElementById('received-files');
-    
-    // Make sure file list containers are visible
-    const fileListContainers = document.querySelectorAll('.list-container');
-    fileListContainers.forEach(container => {
-        container.style.display = 'block';
+    els.statusPill = document.getElementById('connection-status');
+    els.statusText = document.getElementById('connection-status-text');
+    els.shareCard = document.getElementById('share-card');
+    els.hostInfo = document.getElementById('host-info');
+    els.clientInfo = document.getElementById('client-info');
+    els.shareLinkInput = document.getElementById('share-link');
+    els.copyButton = document.getElementById('copy-button');
+    els.qrContainer = document.getElementById('qrcode-container');
+    els.dropZone = document.getElementById('drop-zone');
+    els.fileInput = document.getElementById('file-input');
+    els.activityList = document.getElementById('activity-list');
+    els.emptyState = document.getElementById('empty-state');
+    els.toastContainer = document.getElementById('toast-container');
+    els.settingsButton = document.getElementById('settings-button');
+    els.settingsDrawer = document.getElementById('settings-drawer');
+
+    // NOTE: no forced display overrides here — v1's force-show of both panels
+    // is what broke the tabs. The feed is a single list, so there is nothing to fight.
+
+    applyTheme(getStoredTheme());
+    setupFilterChips();
+    return els;
+}
+
+// --- Theme ---------------------------------------------------------------------------
+function getStoredTheme() {
+    const v = localStorage.getItem(THEME_KEY);
+    if (v === 'light' || v === 'dark') return v;
+    return 'system';
+}
+
+export function applyTheme(theme) {
+    let effective = theme;
+    if (theme === 'system') {
+        effective = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    document.documentElement.dataset.theme = effective;
+}
+
+function setupFilterChips() {
+    document.querySelectorAll('.chip[data-filter]').forEach(chip => {
+        chip.addEventListener('click', () => setFilter(chip.dataset.filter));
     });
-    
-    // Debug: Check if DOM elements are found
-    console.log('DOM Elements found:', {
-        filesToSendList: !!filesToSendList,
-        receivedFilesList: !!receivedFilesList,
-        dropZone: !!dropZone,
-        fileInput: !!fileInput,
-        hostInfoEl: !!hostInfoEl,
-        shareLinkInput: !!shareLinkInput
-    });
-
-    // Initialize tabs
-    initializeTabs();
-    
-    // Add empty state messages
-    addEmptyStateMessages();
-    
-    // Return UI elements for external use
-    return {
-        connectionStatusEl,
-        hostInfoEl,
-        clientInfoEl,
-        shareLinkInput,
-        copyButton,
-        dropZone,
-        fileInput,
-        filesToSendList,
-        receivedFilesList
-    };
 }
 
-/**
- * Update connection status in UI
- * @param {string} message - Status message
- * @param {boolean} isConnected - Whether connected
- */
-export function updateStatus(message, isConnected = false) {
-    if (connectionStatusEl) {
-        connectionStatusEl.textContent = message;
-        connectionStatusEl.className = isConnected ? 'connected' : 'disconnected';
+export function setFilter(filter) {
+    currentFilter = filter;
+    document.querySelectorAll('.chip[data-filter]').forEach(c =>
+        c.classList.toggle('active', c.dataset.filter === filter));
+    for (const row of els.activityList.querySelectorAll('.file-row')) {
+        const dir = row.dataset.direction;
+        row.hidden = !(filter === 'all' || dir === filter);
     }
-    console.log('Status update:', message);
+    updateEmptyState();
 }
 
-/**
- * Setup UI event handlers
- * @param {object} handlers - Event handler functions
- */
-export function setupUIEvents(handlers) {
-    const { onFileSelect, onFileDrop } = handlers;
-    
-    // Copy button event
-    if (copyButton && shareLinkInput) {
-        copyButton.addEventListener('click', () => {
-            shareLinkInput.select();
-            navigator.clipboard.writeText(shareLinkInput.value).then(() => {
-                copyButton.textContent = 'Copied!';
-                setTimeout(() => {
-                    copyButton.textContent = 'Copy';
-                }, 2000);
-            }).catch(() => {
-                document.execCommand('copy');
-                copyButton.textContent = 'Copied!';
-                setTimeout(() => {
-                    copyButton.textContent = 'Copy';
-                }, 2000);
-            });
-        });
-    }
-    
-    // File drop zone
-    if (dropZone && fileInput) {
-        dropZone.addEventListener('click', () => {
-            fileInput.click();
-        });
-
-        dropZone.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            dropZone.classList.add('dragover');
-        });
-
-        dropZone.addEventListener('dragleave', () => {
-            dropZone.classList.remove('dragover');
-        });
-
-        dropZone.addEventListener('drop', (e) => {
-            e.preventDefault();
-            dropZone.classList.remove('dragover');
-            
-            if (e.dataTransfer.files.length > 0) {
-                onFileDrop(e.dataTransfer.files);
-            }
-        });
-
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                onFileSelect(e.target.files);
-            }
-        });
-    }
+// --- Connection status ------------------------------------------------------------------
+/** @param {'connecting'|'waiting'|'connected'|'error'} state */
+export function setStatus(text, state) {
+    els.statusText.textContent = text;
+    els.statusPill.className = `status-pill ${state}`;
 }
 
-/**
- * Initialize tabs functionality
- */
-export function initializeTabs() {
-    tabButtons = document.querySelectorAll('.tab');
-    tabContents = document.querySelectorAll('.list-container');
-    
-    if (tabButtons.length === 0 || tabContents.length === 0) {
-        console.log('Tabs not found in DOM yet');
-        return;
-    }
-    
-    console.log('Initializing tabs');
-    
-    tabButtons.forEach(button => {
-        button.addEventListener('click', () => {
-            const tabId = button.getAttribute('data-tab');
-            
-            // Update active tab button
-            tabButtons.forEach(btn => {
-                btn.classList.remove('active');
-            });
-            button.classList.add('active');
-            
-            // Show selected tab content
-            tabContents.forEach(content => {
-                if (content.getAttribute('data-content') === tabId) {
-                    content.classList.add('active');
-                } else {
-                    content.classList.remove('active');
-                }
-            });
-        });
-    });
-    
-    // Activate first tab by default
-    if (tabButtons[0]) {
-        tabButtons[0].click();
-    }
+export function showShareCard() {
+    if (els.shareCard) els.shareCard.classList.remove('hidden');
 }
 
-/**
- * Ensure tabs are initialized (called after DOM is fully loaded)
- */
-export function ensureTabsInitialized() {
-    if (!tabButtons || tabButtons.length === 0) {
-        console.log('Tabs not initialized yet, trying again');
-        setTimeout(() => {
-            initializeTabs();
-            
-            if (!tabButtons || tabButtons.length === 0) {
-                console.log('Still no tabs found, trying one more time');
-                setTimeout(initializeTabs, 500);
-            }
-        }, 100);
-    }
+export function setClientConnectedText(peerName) {
+    showShareCard();
+    if (els.hostInfo) els.hostInfo.classList.add('hidden');
+    if (!els.clientInfo) return;
+    els.clientInfo.classList.remove('hidden');
+    els.clientInfo.innerHTML = `<p><i class="fas fa-check-circle"></i> Connected${peerName ? ` to <strong>${escapeHtml(peerName)}</strong>` : ''}</p>`;
 }
 
-/**
- * Add empty state messages to file lists
- */
-export function addEmptyStateMessages() {
-    if (filesToSendList) {
-        const emptyMessage = document.createElement('div');
-        emptyMessage.className = 'empty-state';
-        emptyMessage.innerHTML = '<i class="fas fa-cloud-upload-alt"></i><p>Drop files here or click to select</p>';
-        filesToSendList.appendChild(emptyMessage);
-        
-        // Set up observer to show/hide empty state
-        setupEmptyStateObservers(filesToSendList, emptyMessage, 'fa-cloud-upload-alt');
-    }
-    
-    if (receivedFilesList) {
-        const emptyMessage = document.createElement('div');
-        emptyMessage.className = 'empty-state';
-        emptyMessage.innerHTML = '<i class="fas fa-cloud-download-alt"></i><p>No files received yet</p>';
-        receivedFilesList.appendChild(emptyMessage);
-        
-        // Set up observer to show/hide empty state
-        setupEmptyStateObservers(receivedFilesList, emptyMessage, 'fa-cloud-download-alt');
-    }
+/** Remove one activity row after the user dismisses it. */
+export function removeFileRow(fileId) {
+    const row = els.activityList?.querySelector(`[data-file-id="${cssEscape(fileId)}"]`);
+    if (row) row.remove();
+    liveStats.delete(fileId);
+    updateEmptyState();
 }
 
-/**
- * Set up observers for empty state messages
- * @param {HTMLElement} listElement - The list element to observe
- * @param {HTMLElement} emptyMessage - The empty state message element
- * @param {string} iconClass - Icon class for the empty state
- */
-export function setupEmptyStateObservers(listElement, emptyMessage, iconClass) {
-    // Initial check
-    checkAndUpdateEmptyState(listElement);
-    
-    // Create a mutation observer to watch for changes
-    const observer = new MutationObserver(() => {
-        checkAndUpdateEmptyState(listElement);
-    });
-    
-    // Start observing
-    observer.observe(listElement, { 
-        childList: true,
-        subtree: true
-    });
-    
-    function checkAndUpdateEmptyState(listElement) {
-        // Count non-empty-state children
-        let fileCount = 0;
-        
-        for (const child of listElement.children) {
-            if (!child.classList.contains('empty-state')) {
-                fileCount++;
-            }
-        }
-        
-        // Show/hide empty state based on file count
-        if (fileCount === 0) {
-            emptyMessage.style.display = 'flex';
-        } else {
-            emptyMessage.style.display = 'none';
-        }
-    }
-}
+// --- Activity list ---------------------------------------------------------------------
+export function addFileRow(fileId, direction, { name, size }) {
+    if (els.activityList.querySelector(`[data-file-id="${cssEscape(fileId)}"]`)) return null;
 
-/**
- * Create a file element for UI
- * @param {File|object} file - File object or file info
- * @param {string} type - 'send' or 'receive'
- * @returns {object} File element info
- */
-export function createFileElement(file, type) {
-    const fileId = file.id || `file-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-    const fileName = file.name;
-    const fileSize = file.size;
-    
-    const listElement = type === 'send' ? filesToSendList : receivedFilesList;
-    
-    return {
-        fileId,
-        element: addFileToUI(listElement, fileId, fileName, fileSize, type === 'send' ? 'pending' : 'receiving')
-    };
-}
+    const row = document.createElement('li');
+    row.className = 'file-row';
+    row.dataset.fileId = fileId;
+    row.dataset.direction = direction;
+    if (!(currentFilter === 'all' || currentFilter === direction)) row.hidden = true;
 
-/**
- * Add a file to the UI
- * @param {HTMLElement} listElement - List element to add to
- * @param {string} fileId - Unique file ID
- * @param {string} fileName - File name
- * @param {number} fileSize - File size in bytes
- * @param {string} status - File status
- * @returns {HTMLElement} The created file element
- */
-export function addFileToUI(listElement, fileId, fileName, fileSize, status) {
-    // Create file element
-    const fileElement = document.createElement('div');
-    fileElement.className = 'file-item';
-    fileElement.dataset.fileId = fileId;
-    
-    // Get icon based on file type
-    const iconClass = getFileTypeIcon(fileName);
-    
-    // Create file content
-    fileElement.innerHTML = `
-        <div class="file-icon">
-            <i class="fas ${iconClass}"></i>
-        </div>
-        <div class="file-info">
-            <div class="file-name">${fileName}</div>
-            <div class="file-size">${formatBytes(fileSize)}</div>
-            <div class="file-status">${status}</div>
-            <div class="progress-container">
+    const iconClass = getFileTypeIcon(name);
+    const dirLabel = direction === 'send' ? 'Sent' : 'Received';
+    row.innerHTML = `
+        <div class="file-icon" aria-hidden="true"><i class="fas ${iconClass}"></i></div>
+        <div class="file-main">
+            <div class="file-topline">
+                <div class="file-name" title="${escapeHtml(name)}">${escapeHtml(name)}</div>
+                <div class="status-chip queued">Queued</div>
+            </div>
+            <div class="file-meta">
+                <span class="dir-badge ${direction}"><i class="fas fa-${direction === 'send' ? 'paper-plane' : 'download'}"></i>${dirLabel}</span>
+                <span class="file-size">${formatBytes(size || 0)}</span>
+                <span class="speed-text"></span>
+            </div>
+            <div class="progress-container hidden">
                 <div class="progress-bar" style="width: 0%"></div>
-                <div class="progress-percentage">0%</div>
             </div>
         </div>
-        <div class="file-actions">
-            <!-- Actions will be added based on status -->
-        </div>
-    `;
-    
-    // Add to list
-    listElement.appendChild(fileElement);
-    
-    return fileElement;
+        <div class="row-actions"></div>`;
+
+    els.activityList.appendChild(row);
+    updateEmptyState();
+    return row;
 }
 
 /**
- * Update file status in UI
- * @param {HTMLElement} listElement - List element containing the file
- * @param {string} fileId - File ID
- * @param {string} status - New status
- * @param {number} progress - Progress percentage (0-100)
- * @param {string} downloadUrl - URL for download (optional)
- * @param {string} fileName - File name (optional)
+ * Update a file row from its record + live stats.
+ * @param {string} fileId
+ * @param {'send'|'receive'} direction
+ * @param {{status: string, progress?: number, error?: string|null, verified?: boolean, name?: string}} state
  */
-export function updateFileStatus(listElement, fileId, status, progress, downloadUrl = null, fileName = null) {
-    const fileElement = listElement.querySelector(`[data-file-id="${fileId}"]`);
-    if (!fileElement) return;
-    
-    // Update status text
-    const statusElement = fileElement.querySelector('.file-status');
-    if (statusElement) {
-        statusElement.textContent = status;
+export function updateFileRow(fileId, direction, state) {
+    const row = els.activityList.querySelector(`[data-file-id="${cssEscape(fileId)}"]`);
+    if (!row) return;
+
+    const chip = row.querySelector('.status-chip');
+    const speedEl = row.querySelector('.speed-text');
+    const progressWrap = row.querySelector('.progress-container');
+    const bar = row.querySelector('.progress-bar');
+    const actions = row.querySelector('.row-actions');
+
+    // Status chip
+    const { label, cls } = describeStatus(direction, state);
+    chip.textContent = label;
+    chip.className = `status-chip ${cls}`;
+
+    // Progress bar
+    if (['sending', 'hashing', 'receiving'].includes(state.status) && typeof state.progress === 'number') {
+        progressWrap.classList.remove('hidden');
+        bar.style.width = `${state.progress}%`;
+    } else {
+        progressWrap.classList.add('hidden');
     }
-    
-    // Update progress bar and percentage
-    const progressBar = fileElement.querySelector('.progress-bar');
-    if (progressBar) {
-        progressBar.style.width = `${progress}%`;
+
+    // Speed / ETA
+    const stats = liveStats.get(fileId);
+    if (stats && stats.speedBps > 0 && ['sending', 'receiving'].includes(state.status)) {
+        speedEl.textContent = formatSpeed(stats.speedBps) + (stats.etaSec != null ? ` · ETA ${formatEta(stats.etaSec)}` : '');
+    } else if (state.error) {
+        speedEl.textContent = friendlyError(state.error);
+    } else {
+        speedEl.textContent = '';
     }
-    
-    // Update progress percentage text
-    const progressPercentage = fileElement.querySelector('.progress-percentage');
-    if (progressPercentage) {
-        progressPercentage.textContent = `${progress}%`;
-    }
-    
-    // Show/hide progress bar based on status
-    const progressContainer = fileElement.querySelector('.progress-container');
-    if (progressContainer) {
-        if (status === 'complete' || status === 'error') {
-            progressContainer.style.display = 'none';
-        } else {
-            progressContainer.style.display = 'block';
-        }
-    }
-    
-    // Update actions
-    const actionsContainer = fileElement.querySelector('.file-actions');
-    if (actionsContainer) {
-        actionsContainer.innerHTML = '';
-        
-        if (status === 'complete' && downloadUrl) {
-            // Add download button
-            const downloadButton = document.createElement('button');
-            downloadButton.className = 'download-button';
-            downloadButton.innerHTML = '<i class="fas fa-download"></i>';
-            downloadButton.title = 'Download';
-            downloadButton.addEventListener('click', () => {
-                triggerFileDownload(downloadUrl, fileName);
-            });
-            actionsContainer.appendChild(downloadButton);
-        }
-        
-        if (status === 'error') {
-            // Add retry button for sent files
-            if (listElement.id === 'files-to-send') {
-                const retryButton = document.createElement('button');
-                retryButton.className = 'retry-button';
-                retryButton.innerHTML = '<i class="fas fa-redo"></i>';
-                retryButton.title = 'Retry';
-                retryButton.addEventListener('click', () => {
-                    // Dispatch custom event for retry
-                    const event = new CustomEvent('file-retry', { 
-                        detail: { fileId } 
-                    });
-                    document.dispatchEvent(event);
-                });
-                actionsContainer.appendChild(retryButton);
+
+    renderActions(row, direction, state);
+}
+
+function describeStatus(direction, s) {
+    switch (s.status) {
+        case 'queued': return { label: 'Queued', cls: 'queued' };
+        case 'hashing': return { label: `Preparing ${s.progress ?? 0}%`, cls: 'working' };
+        case 'sending': return { label: `Sending ${s.progress ?? 0}%`, cls: 'active' };
+        case 'receiving': return { label: `Receiving ${s.progress ?? 0}%`, cls: 'active' };
+        case 'paused': return { label: 'Paused', cls: 'paused' };
+        case 'complete':
+            if (direction === 'receive') {
+                return s.verified === false ? { label: 'Check failed', cls: 'error' } : { label: 'Done', cls: 'done' };
             }
+            return { label: 'Done', cls: 'done' };
+        case 'cancelled': return { label: 'Cancelled', cls: 'muted' };
+        case 'error': return { label: 'Failed', cls: 'error' };
+        default: return { label: s.status, cls: 'queued' };
+    }
+}
+
+function friendlyError(error) {
+    switch (error) {
+        case 'no connection': return 'Connection lost — reconnecting';
+        case 'send failed': return 'Send failed — retry when ready';
+        case 'read failed': return "Couldn't read the file";
+        case 'checksum mismatch': return 'Data corrupted in transit';
+        case 'integrity check failed': return 'Checksum mismatch — download blocked';
+        case 'assembly failed': return 'Failed to assemble file';
+        default: return error ? String(error) : '';
+    }
+}
+
+function renderActions(row, direction, state) {
+    const actions = row.querySelector('.row-actions');
+    actions.innerHTML = '';
+    if (!actions.dataset.fileId) actions.dataset.fileId = row.dataset.fileId;
+    const fileId = row.dataset.fileId;
+
+    const btn = (icon, title, cls) => {
+        const b = document.createElement('button');
+        b.className = `row-btn ${cls}`;
+        b.title = title;
+        b.setAttribute('aria-label', title);
+        b.innerHTML = `<i class="fas fa-${icon}"></i>`;
+        return b;
+    };
+
+    if (direction === 'send') {
+        if (state.status === 'sending' || state.status === 'hashing') {
+            const p = btn('pause', 'Pause transfer', ''); p.onclick = () => emitAction(fileId, 'pause'); actions.appendChild(p);
+            const c = btn('xmark', 'Cancel transfer', 'danger'); c.onclick = () => emitAction(fileId, 'cancel'); actions.appendChild(c);
+        } else if (state.status === 'paused') {
+            const r = btn('play', 'Resume transfer', ''); r.onclick = () => emitAction(fileId, 'resume'); actions.appendChild(r);
+            const c = btn('xmark', 'Cancel transfer', 'danger'); c.onclick = () => emitAction(fileId, 'cancel'); actions.appendChild(c);
+        } else if (state.status === 'queued') {
+            const p = btn('pause', 'Hold in queue', ''); p.onclick = () => emitAction(fileId, 'pause'); actions.appendChild(p);
+            const c = btn('xmark', 'Remove from queue', 'danger'); c.onclick = () => emitAction(fileId, 'cancel'); actions.appendChild(c);
+        } else if (['error'].includes(state.status)) {
+            const r = btn('rotate-right', 'Retry transfer', ''); r.onclick = () => emitAction(fileId, 'retry'); actions.appendChild(r);
+            const c = btn('xmark', 'Remove', 'danger'); c.onclick = () => emitAction(fileId, 'cancel'); actions.appendChild(c);
+        } else if (state.status === 'complete') {
+            const r = btn('rotate-right', 'Send again', ''); r.onclick = () => emitAction(fileId, 'resend'); actions.appendChild(r);
+            const x = btn('xmark', 'Remove from list', 'muted-btn'); x.onclick = () => emitAction(fileId, 'remove'); actions.appendChild(x);
+        } else if (state.status === 'cancelled') {
+            const r = btn('rotate-right', 'Retry transfer', ''); r.onclick = () => emitAction(fileId, 'retry'); actions.appendChild(r);
+            const x = btn('xmark', 'Remove from list', 'muted-btn'); x.onclick = () => emitAction(fileId, 'remove'); actions.appendChild(x);
+        }
+    } else {
+        // receive direction
+        if (['receiving'].includes(state.status)) {
+            const c = btn('xmark', 'Decline transfer', 'danger'); c.onclick = () => emitAction(fileId, 'decline'); actions.appendChild(c);
+        } else if (state.status === 'complete' && state.verified !== false) {
+            const d = btn('download', 'Download file', ''); d.onclick = () => emitAction(fileId, 'download'); actions.appendChild(d);
+            const x = btn('xmark', 'Remove from list', 'muted-btn'); x.onclick = () => emitAction(fileId, 'remove'); actions.appendChild(x);
+        } else if (state.status === 'error') {
+            const x = btn('xmark', 'Remove', 'danger'); x.onclick = () => emitAction(fileId, 'remove'); actions.appendChild(x);
         }
     }
 }
 
-/**
- * Trigger file download
- * @param {string} url - File URL
- * @param {string} fileName - File name
- */
-export function triggerFileDownload(url, fileName) {
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fileName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-
-    // Revoke the object URL after download starts
-    setTimeout(() => {
-        URL.revokeObjectURL(url);
-    }, 100);
+function emitAction(fileId, action) {
+    document.dispatchEvent(new CustomEvent('file-action', { detail: { fileId, action } }));
 }
 
+// --- Stats display ------------------------------------------------------------------------
+/** (fileId, direction, {speedBps, etaSec}) */
+export function updateStats(fileId, stats) {
+    liveStats.set(fileId, stats);
+    const row = els.activityList.querySelector(`[data-file-id="${cssEscape(fileId)}"]`);
+    if (!row) return;
+    // Refresh speed text without rebuilding actions.
+    const stateChip = row.querySelector('.status-chip');
+    const speedEl = row.querySelector('.speed-text');
+    if (stats.speedBps > 0 && /Sending|Receiving/.test(stateChip.textContent)) {
+        speedEl.textContent = formatSpeed(stats.speedBps) + (stats.etaSec != null ? ` · ETA ${formatEta(stats.etaSec)}` : '');
+    }
+}
+
+// --- Toasts -------------------------------------------------------------------------------
 /**
- * Generate a QR code for the given URL in the qrcode container
- * @param {string} url - URL to encode
+ * @param {string} message
+ * @param {'info'|'success'|'error'} [kind]
  */
+export function showToast(message, kind = 'info') {
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${kind}`;
+    const icons = { info: 'fa-circle-info', success: 'fa-check-circle', error: 'fa-triangle-exclamation' };
+    toast.innerHTML = `<i class="fas ${icons[kind] || icons.info}"></i><span>${escapeHtml(message)}</span>`;
+    els.toastContainer.appendChild(toast);
+    setTimeout(() => toast.classList.add('visible'), 20);
+    setTimeout(() => {
+        toast.classList.remove('visible');
+        setTimeout(() => toast.remove(), 300);
+    }, 4200);
+}
+
+// --- QR code ---------------------------------------------------------------------------------
 export function generateQRCode(url) {
-    if (!qrCodeContainerEl) return;
-    qrCodeContainerEl.innerHTML = '';
-    // QRCode is loaded as a global from the CDN script
-    new window.QRCode(qrCodeContainerEl, {
+    if (!els.qrContainer || typeof window.QRCode === 'undefined') return;
+    els.qrContainer.innerHTML = '';
+    new window.QRCode(els.qrContainer, {
         text: url,
-        width: 160,
-        height: 160,
-        colorDark: '#000000',
+        width: 148,
+        height: 148,
+        colorDark: '#1e293b',
         colorLight: '#ffffff',
-        correctLevel: window.QRCode.CorrectLevel.H
+        correctLevel: window.QRCode.CorrectLevel.M,
     });
+}
+
+// --- Settings drawer ---------------------------------------------------------------------------
+export function initSettingsDrawer({ onDeviceName, onAutoDownload, onTheme }) {
+    const input = document.getElementById('device-name-input');
+    const autoToggle = document.getElementById('auto-download-toggle');
+    const themeSelect = document.getElementById('theme-select');
+
+    els.settingsButton.addEventListener('click', () => openSettings());
+
+    // Close handlers
+    els.settingsDrawer.querySelectorAll('[data-close-settings]').forEach(el =>
+        el.addEventListener('click', closeSettings));
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSettings(); });
+
+    input.value = localStorage.getItem('fs2p-device-name') || '';
+    autoToggle.checked = getAutoDownloadDefault();
+    themeSelect.value = getStoredTheme();
+
+    input.addEventListener('change', () => onDeviceName?.(input.value));
+    autoToggle.addEventListener('change', () => onAutoDownload?.(autoToggle.checked));
+    themeSelect.addEventListener('change', () => {
+        localStorage.setItem(THEME_KEY, themeSelect.value);
+        applyTheme(themeSelect.value);
+        onTheme?.(themeSelect.value);
+    });
+
+    function getAutoDownloadDefault() {
+        try { return (localStorage.getItem('fs2p-auto-download') ?? '1') === '1'; } catch { return true; }
+    }
+}
+
+export function openSettings() { els.settingsDrawer.classList.remove('hidden'); }
+export function closeSettings() { els.settingsDrawer.classList.add('hidden'); }
+
+// --- Helpers -------------------------------------------------------------------------------------
+function updateEmptyState() {
+    const rows = [...els.activityList.querySelectorAll('.file-row')];
+    const visible = rows.filter(r => !r.hidden).length;
+    els.emptyState.classList.toggle('is-hidden', visible > 0);
+    const note = els.emptyState.querySelector('p');
+    if (note) {
+        note.textContent = rows.length === 0
+            ? 'No transfers yet. Add files above to get started.'
+            : 'Nothing in this view.';
+    }
+}
+
+function formatSpeed(bps) {
+    return `${formatBytes(bps, 1)}/s`;
+}
+
+function formatEta(sec) {
+    if (!isFinite(sec) || sec <= 0) return '—';
+    if (sec < 60) return `${Math.ceil(sec)}s`;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    if (m < 60) return `${m}m ${s.toString().padStart(2, '0')}s`;
+    const h = Math.floor(m / 60);
+    return `${h}h ${(m % 60).toString().padStart(2, '0')}`;
+}
+
+function escapeHtml(str) {
+    return String(str ?? '').replace(/[&<>"']/g, c => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    }[c]));
+}
+
+function cssEscape(id) {
+    return typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(id) : id.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
 }

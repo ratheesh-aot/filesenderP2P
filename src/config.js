@@ -1,7 +1,7 @@
 // Configuration settings for the application
 
-// Server port
-const PORT = 3001; // Changed port to avoid conflict
+// Server port (override with PORT env for tests)
+const PORT = parseInt(process.env.PORT, 10) || 3001; // Changed port to avoid conflict
 
 // MIME types for different file extensions
 const MIME_TYPES = {
@@ -14,7 +14,8 @@ const MIME_TYPES = {
     '.jpeg': 'image/jpeg',
     '.gif': 'image/gif',
     '.svg': 'image/svg+xml',
-    '.ico': 'image/x-icon'
+    '.ico': 'image/x-icon',
+    '.webmanifest': 'application/manifest+json'
 };
 
 module.exports = {

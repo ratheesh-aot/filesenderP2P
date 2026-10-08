@@ -4,6 +4,11 @@ const connectionManager = require('./connectionManager');
 const roomManager = require('./roomManager');
 const signalHandler = require('./signalHandler');
 
+// Keepalive tuning: proxies (e.g. Vercel) drop idle sockets, so we ping
+// regularly and terminate connections that stop answering pongs.
+const PING_INTERVAL_MS = 30000;
+const MAX_MESSAGE_BYTES = 16 * 1024 * 1024; // signaling frames are tiny; cap at 16 MB
+
 /**
  * Create and configure the WebSocket server
  * @param {http.Server} httpServer - HTTP server to attach the WebSocket server to
@@ -11,7 +16,22 @@ const signalHandler = require('./signalHandler');
  */
 function createWebSocketServer(httpServer) {
     // Create WebSocket server attached to HTTP server
-    const wss = new Server({ server: httpServer });
+    const wss = new Server({
+        server: httpServer,
+        maxPayload: MAX_MESSAGE_BYTES,
+    });
+
+    // Periodic ping sweep; terminate dead connections.
+    setInterval(() => {
+        for (const client of wss.clients) {
+            if (!client.isAlive) {
+                try { client.terminate(); } catch { /* ignore */ }
+                continue;
+            }
+            client.isAlive = false;
+            try { client.ping(); } catch { /* ignore */ }
+        }
+    }, PING_INTERVAL_MS).unref?.();
 
     // WebSocket server handling
     wss.on('connection', handleConnection);
@@ -26,7 +46,11 @@ function createWebSocketServer(httpServer) {
 function handleConnection(ws) {
     console.log('WebSocket client connected');
     let clientId = null;
-    
+
+    // Track liveness for the ping sweep.
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
@@ -39,6 +63,7 @@ function handleConnection(ws) {
                     break;
                     
                 case 'join':
+                    if (data.peerId) clientId = data.peerId;
                     handleJoin(ws, data, clientId);
                     break;
                     
@@ -90,18 +115,23 @@ function handleRegister(ws, data, clientId) {
  */
 function handleJoin(ws, data, clientId) {
     // Client wants to join a room (connect to a host)
-    if (data.hostId && clientId) {
+    const joinerId = data.peerId || clientId;
+    if (data.hostId && joinerId) {
         const hostId = data.hostId;
         const hostWs = connectionManager.getConnection(hostId);
+
+        if (!connectionManager.getConnection(joinerId)) {
+            connectionManager.registerConnection(joinerId, ws);
+        }
         
         if (connectionManager.isConnectionActive(hostId)) {
             // Add client to room
-            roomManager.addClientToRoom(hostId, clientId);
+            roomManager.addClientToRoom(hostId, joinerId);
             
             // Notify host that a client wants to join
             hostWs.send(JSON.stringify({
                 type: 'client-joined',
-                clientId: clientId
+                clientId: joinerId
             }));
             
             // Notify client that join request was sent

@@ -2,67 +2,121 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FileSender P2P</title>
-    <link rel="stylesheet" href="style.css">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>FileSender — P2P File Transfer</title>
+    <meta name="description" content="Share files directly between browsers over an encrypted peer-to-peer connection. No uploads, no accounts.">
+    <link rel="manifest" href="manifest.webmanifest">
+    <meta name="theme-color" content="#e7ecef">
+    <link rel="apple-touch-icon" href="icons/icon-192.svg">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css">
 </head>
 <body>
     <div class="container">
-        <h1><i class="fas fa-bolt"></i> FileSender P2P <i class="fas fa-network-wired"></i></h1>
-        <div class="glow-effect"></div>
-        
-        <div id="status">
-            <p><i class="fas fa-signal"></i> Status: <span id="connection-status">Initializing...</span></p>
-            <div id="connection-info">
-                <div id="host-info" style="display: none;">
-                    <p><i class="fas fa-share-alt"></i> Share this link with your peer:</p>
-                    <div class="input-group">
-                        <input type="text" id="share-link" readonly>
-                        <button id="copy-button"><i class="fas fa-copy"></i> Copy</button>
-                    </div>
-                    <div id="qrcode-section">
-                        <p class="qrcode-label"><i class="fas fa-qrcode"></i> Or scan to connect:</p>
-                        <div id="qrcode-container"></div>
-                    </div>
+
+        <!-- Header -->
+        <header class="app-header">
+            <h1 class="app-title"><i class="fas fa-bolt"></i> FileSender</h1>
+            <div id="connection-status" class="status-pill disconnected" title="Connection status">
+                <span class="status-dot"></span>
+                <span id="connection-status-text">Connecting…</span>
+            </div>
+            <button id="settings-button" class="icon-button" title="Settings" aria-label="Open settings">
+                <i class="fas fa-gear"></i>
+            </button>
+        </header>
+
+        <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+        <!-- Share / peer card -->
+        <section id="share-card" class="share-card hidden">
+            <div id="host-info">
+                <p class="share-label"><i class="fas fa-share-alt"></i> Send this link to your peer</p>
+                <div class="input-group">
+                    <input type="text" id="share-link" readonly aria-label="Shareable link">
+                    <button id="copy-button" title="Copy link"><i class="fas fa-copy"></i></button>
                 </div>
-                <div id="client-info" style="display: none;">
-                    <p>Connecting to host...</p>
+                <div id="qrcode-section">
+                    <p class="qrcode-label"><i class="fas fa-qrcode"></i> Or scan to connect</p>
+                    <div id="qrcode-container" aria-hidden="true"></div>
                 </div>
             </div>
-        </div>
+            <div id="client-info" class="hidden">
+                <p><i class="fas fa-link"></i> Connecting to host…</p>
+            </div>
+        </section>
 
-        <div id="drop-zone" class="drop-zone">
-            <p><i class="fas fa-cloud-upload-alt"></i> Drag & Drop files here or click to select</p>
-            <div class="upload-icon"><i class="fas fa-file-upload"></i></div>
+        <!-- Drop zone -->
+        <div id="drop-zone" class="drop-zone" role="button" tabindex="0" aria-label="Add files to send">
+            <div class="upload-icon"><i class="fas fa-cloud-arrow-up"></i></div>
+            <p class="drop-text">Drop files here or <span class="linkish">browse</span></p>
             <input type="file" id="file-input" multiple style="display: none;">
         </div>
 
-        <div class="tabs-container">
-            <div class="tab active" data-tab="send"><i class="fas fa-paper-plane"></i> Send Files</div>
-            <div class="tab" data-tab="receive"><i class="fas fa-download"></i> Received Files</div>
-        </div>
-        
-        <div class="file-lists">
-            <div class="list-container active" data-content="send">
-                <ul id="files-to-send"></ul>
+        <!-- Activity feed -->
+        <section class="feed-section">
+            <div class="feed-header">
+                <h2 class="feed-title"><i class="fas fa-list-check"></i> Activity</h2>
+                <div class="filter-chips" role="tablist">
+                    <button class="chip active" data-filter="all">All</button>
+                    <button class="chip" data-filter="send"><i class="fas fa-paper-plane"></i> Sent</button>
+                    <button class="chip" data-filter="receive"><i class="fas fa-download"></i> Received</button>
+                </div>
             </div>
-            <div class="list-container" data-content="receive">
-                <ul id="received-files"></ul>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <div class="pulse-circle"></div>
-            <p>Secure P2P File Transfer</p>
-        </div>
+            <ul id="activity-list" class="activity-list">
+                <li id="empty-state" class="empty-state">
+                    <i class="fas fa-inbox"></i>
+                    <p>No transfers yet. Add files above to get started.</p>
+                </li>
+            </ul>
+        </section>
+
+        <!-- Footer -->
+        <footer class="app-footer">
+            <div class="pulse-circle" aria-hidden="true"></div>
+            <p><i class="fas fa-shield-halved"></i> Files travel directly between browsers — never through a server.</p>
+        </footer>
 
     </div>
-    
+
+    <!-- Settings drawer -->
+    <aside id="settings-drawer" class="settings-drawer hidden" aria-label="Settings">
+        <div class="drawer-backdrop" data-close-settings></div>
+        <div class="drawer-panel">
+            <div class="drawer-head">
+                <h3><i class="fas fa-sliders"></i> Settings</h3>
+                <button type="button" class="icon-button" data-close-settings aria-label="Close settings">
+                    <i class="fas fa-xmark"></i>
+                </button>
+            </div>
+
+            <label class="setting-row">
+                <span>Your device name</span>
+                <input type="text" id="device-name-input" maxlength="40" placeholder="e.g. Ratheesh's MacBook" aria-label="Device name">
+            </label>
+
+            <label class="setting-row toggle-row">
+                <span>Auto-download received files</span>
+                <input type="checkbox" id="auto-download-toggle">
+            </label>
+
+            <div class="setting-row">
+                <span>Theme</span>
+                <select id="theme-select" aria-label="Theme">
+                    <option value="system">System</option>
+                    <option value="light">Light</option>
+                    <option value="dark">Dark</option>
+                </select>
+            </div>
+
+            <p class="drawer-note"><i class="fas fa-circle-info"></i> Settings are stored only in this browser.</p>
+        </div>
+    </aside>
+
     <!-- QR Code library -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-    <!-- Add SimplePeer library -->
+    <!-- SimplePeer (WebRTC) -->
     <script src="https://unpkg.com/simple-peer@9.11.1/simplepeer.min.js"></script>
     <script src="script.js" type="module"></script>
 </body>

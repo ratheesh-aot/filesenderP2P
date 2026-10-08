@@ -1,645 +1,620 @@
 /**
- * Transfer Manager for FileSender P2P
- * Handles file transfer operations, chunking, and acknowledgments
+ * Transfer Manager v2 for FileSender P2P
+ *
+ * Protocol:
+ *  - Control messages travel as JSON strings over the data channel.
+ *  - File chunks travel as raw binary frames (no base64 overhead):
+ *      [u8 magic "FS2P"][u32 fileIndex LE][u32 chunkIndex LE][u8 flags]
+ *      [u8[32] SHA-256 of payload][payload bytes...]
+ *  - Chunks stay under 64 KB so they fit Chrome's default SCTP max-message-size.
+ *  - Sender pre-hashes every chunk (SHA-256) and sends a Merkle root in the
+ *    metadata message. Receiver verifies each chunk hash on arrival and the
+ *    full Merkle root at completion -> "verified" badge.
  */
-import { sendMessage } from './connectionManager.js';
 
-// Connection manager reference
-let connectionManager;
+import { sendMessage, sendBinary } from './connectionManager.js';
 
-// Transfer settings
-const CHUNK_SIZE = 64 * 1024; // 64KB chunks
-const MAX_CHUNKS_IN_FLIGHT = 10; // Maximum number of chunks to send before waiting for acknowledgment
-let chunksInFlight = 0; // Track how many chunks are currently being sent
-let transferQueue = []; // Queue for files waiting to be sent
-let pendingChunks = new Map(); // Track chunks that have been sent but not acknowledged
+// --- Tunables -------------------------------------------------------------
+const CHUNK_SIZE = 60 * 1024;           // stay under the 64 KB SCTP message limit
+const MAGIC = [0x46, 0x53, 0x32, 0x50]; // "FS2P"
+const HEADER_LEN = 4 + 4 + 4 + 1;       // magic + fileIndex + chunkIndex + flags
+const HASH_LEN = 32;                    // SHA-256
+const STATS_WINDOW_MS = 6000;           // rolling window for speed calculation
+const STATS_TICK_MS = 500;              // how often stats are recomputed
 
-// Event callbacks
+// --- State ------------------------------------------------------------------
+let fileManager = null;
+let connectionManager = null;
 let callbacks = {
-    onTransferStart: () => { },
-    onTransferProgress: () => { },
-    onTransferComplete: () => { },
-    onTransferError: () => { },
-    onChunkReceived: () => { }
+    onStats: () => {},
+    /** (fileId, {name,size,type}) when a send-side file is queued */
+    onFileQueued: () => {},
+    /** (fileId, meta) when an incoming file is announced by metadata */
+    onIncoming: () => {},
 };
 
-// File manager reference
-let fileManager;
+/** @type {Map<string, object>} fileId -> send-side state */
+const filesToSend = new Map();
+/** @type {Map<string, object>} fileId -> receive-side state */
+const receivedFiles = new Map();
+/** fileIndex (wire id) -> fileId for incoming files */
+const indexToReceivedId = new Map();
 
+let transferQueue = [];                 // ordered list of fileIds waiting to send
+let activeFileId = null;                // the file currently being sent
+let nextFileIndex = 0;                  // sender-side wire ids, sequential per session
+let chunksInFlight = 0;
+let windowSize = 8;                     // adaptive in-flight chunk window
+const pendingChunks = new Map();        // `${fileId}:${idx}` -> {sentAt}
+
+// Rolling throughput samples: fileId+direction -> [{t, bytes}]
+const statsSamples = new Map();
+let statsTimer = null;
+
+// --- Crypto helpers ---------------------------------------------------------
+async function sha256(buffer) {
+    const digest = await crypto.subtle.digest('SHA-256', buffer);
+    return new Uint8Array(digest);
+}
+
+function concatBytes(a, b) {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+}
+
+/** Build a Merkle root from an array of 32-byte leaf hashes. */
+async function merkleRoot(leafHashes) {
+    if (leafHashes.length === 0) return new Uint8Array(HASH_LEN);
+    let level = leafHashes;
+    while (level.length > 1) {
+        const next = [];
+        for (let i = 0; i < level.length; i += 2) {
+            const left = level[i];
+            const right = i + 1 < level.length ? level[i + 1] : level[i]; // duplicate last when odd
+            next.push(await sha256(concatBytes(left, right)));
+        }
+        level = next;
+    }
+    return level[0];
+}
+
+// --- Binary frame helpers ----------------------------------------------------
+function buildFrame(fileIndex, chunkIndex, hash, payload) {
+    const frame = new ArrayBuffer(HEADER_LEN + HASH_LEN + payload.byteLength);
+    const view = new DataView(frame);
+    for (let i = 0; i < MAGIC.length; i++) view.setUint8(i, MAGIC[i]);
+    view.setUint32(4, fileIndex, true);
+    view.setUint32(8, chunkIndex, true);
+    view.setUint8(12, 0); // flags (reserved)
+    new Uint8Array(frame, HEADER_LEN, HASH_LEN).set(hash);
+    new Uint8Array(frame, HEADER_LEN + HASH_LEN).set(new Uint8Array(payload));
+    return frame;
+}
+
+/** Parse a binary frame. Returns {fileIndex, chunkIndex, hash, payload} or null. */
+function parseFrame(data) {
+    let u8;
+    if (data instanceof ArrayBuffer) {
+        u8 = new Uint8Array(data);
+    } else if (data instanceof Uint8Array) {
+        u8 = data;
+    } else if (typeof Blob !== 'undefined' && data instanceof Blob) {
+        return null; // handled by caller via arrayBuffer()
+    } else {
+        return null;
+    }
+
+    if (u8.byteLength < HEADER_LEN + HASH_LEN) return null;
+    for (let i = 0; i < MAGIC.length; i++) {
+        if (u8[i] !== MAGIC[i]) return null; // not one of our frames
+    }
+    const view = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+    const fileIndex = view.getUint32(4, true);
+    const chunkIndex = view.getUint32(8, true);
+    const hash = u8.slice(HEADER_LEN, HEADER_LEN + HASH_LEN);
+    const payload = u8.slice(HEADER_LEN + HASH_LEN); // copy for safe storage
+    return { fileIndex, chunkIndex, hash, payload };
+}
+
+// --- Stats -------------------------------------------------------------------
+function sampleBytes(fileId, direction, bytes) {
+    const key = `${direction}:${fileId}`;
+    let samples = statsSamples.get(key);
+    if (!samples) {
+        samples = [];
+        statsSamples.set(key, samples);
+    }
+    samples.push({ t: Date.now(), bytes });
+}
+
+function computeStats(fileId, direction) {
+    const key = `${direction}:${fileId}`;
+    const now = Date.now();
+    let samples = (statsSamples.get(key) || []).filter(s => now - s.t <= STATS_WINDOW_MS);
+    statsSamples.set(key, samples);
+    if (samples.length === 0) return { speedBps: 0, etaSec: null };
+
+    const totalBytes = samples.reduce((sum, s) => sum + s.bytes, 0);
+    const spanMs = Math.max(now - samples[0].t, 250); // avoid divide-by-zero spikes
+    const speedBps = (totalBytes / spanMs) * 1000;
+
+    let remaining = 0;
+    if (direction === 'send') {
+        const f = filesToSend.get(fileId);
+        remaining = f ? Math.max(0, f.size - f.ackedChunks * CHUNK_SIZE) : 0;
+    } else {
+        const f = receivedFiles.get(fileId);
+        remaining = f ? Math.max(0, f.size - f.receivedChunks * CHUNK_SIZE) : 0;
+    }
+    const etaSec = speedBps > 0 && remaining > 0 ? remaining / speedBps : null;
+    return { speedBps, etaSec };
+}
+
+function startStatsTicker() {
+    if (statsTimer) return;
+    statsTimer = setInterval(() => {
+        for (const [fileId, f] of filesToSend.entries()) {
+            if (f.status === 'sending' || f.status === 'hashing') {
+                callbacks.onStats(fileId, 'send', computeStats(fileId, 'send'));
+            }
+        }
+        for (const [fileId, f] of receivedFiles.entries()) {
+            if (f.status === 'receiving') {
+                callbacks.onStats(fileId, 'receive', computeStats(fileId, 'receive'));
+            }
+        }
+    }, STATS_TICK_MS);
+}
+
+// --- Initialization -----------------------------------------------------------
 /**
- * Initialize transfer manager
- * @param {object} options - Transfer manager options
- * @param {object} options.fileManager - File manager instance
- * @param {function} options.onTransferStart - Transfer start callback
- * @param {function} options.onTransferProgress - Transfer progress callback
- * @param {function} options.onTransferComplete - Transfer complete callback
- * @param {function} options.onTransferError - Transfer error callback
- * @param {function} options.onChunkReceived - Chunk received callback
- * @returns {object} Transfer manager API
+ * Initialize transfer manager.
+ * @param {object} options
+ * @param {object} options.fileManager - File manager instance (for status bookkeeping)
+ * @param {object} options.connectionManager - Connection manager API
+ * @param {function} [options.onStats] - (fileId, direction, {speedBps, etaSec})
  */
-export function initializeTransferManager(options) {
-    // Set callbacks and file manager
-    callbacks = { ...callbacks, ...options };
+export function initializeTransferManager(options = {}) {
     fileManager = options.fileManager;
     connectionManager = options.connectionManager;
+    callbacks = { ...callbacks, ...options };
+    startStatsTicker();
 
     return {
         handleFiles,
         processTransferQueue,
         handleMessage,
-        handleFileChunk,
-        assembleAndSaveFile,
-        retryFile
+        handleBinaryFrame,
+        pauseFile,
+        resumeFile,
+        cancelFile,
+        retryFile,
+        getSendState: (fileId) => filesToSend.get(fileId),
+        getReceiveState: (fileId) => receivedFiles.get(fileId),
     };
 }
 
+// --- Sender side ---------------------------------------------------------------
 /**
- * Handle files selected for sending
- * @param {FileList} fileList - List of files to send
+ * Handle files selected for sending.
+ * @param {FileList|File[]} fileList
  */
 export function handleFiles(fileList) {
     if (!fileList || fileList.length === 0) return;
 
-    console.log('Handling files:', fileList);
-
-    // Add each file to the queue
-    for (let i = 0; i < fileList.length; i++) {
-        const file = fileList[i];
-        const fileId = fileManager.addFileToSend(file);
-
-        // Add to transfer queue
-        transferQueue.push({
+    for (const file of Array.from(fileList)) {
+        const fileId = `f-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+        const chunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+        filesToSend.set(fileId, {
             fileId,
-            file
+            fileIndex: nextFileIndex++,
+            file,
+            name: file.name,
+            size: file.size,
+            type: file.type || 'application/octet-stream',
+            chunks,
+            status: 'queued',
+            progress: 0,
+            sentChunks: 0,
+            ackedChunks: 0,
+            hashes: null,      // filled during hashing phase
+            rootHash: null,
+            error: null,
+            metadataSent: false,
         });
+        transferQueue.push(fileId);
+        if (fileManager && fileManager.registerSendFile) {
+            fileManager.registerSendFile(fileId, {
+                name: file.name,
+                size: file.size,
+                type: file.type || 'application/octet-stream',
+            });
+        }
+        callbacks.onFileQueued?.(fileId, { name: file.name, size: file.size, type: file.type || 'application/octet-stream' });
+        notifyStatus(fileId, 'send');
     }
 
-    // Process the queue
     processTransferQueue();
 }
 
-/**
- * Process the transfer queue
- */
+function isConnected() {
+    return !!(connectionManager && connectionManager.isConnected());
+}
+
+/** Start the next queued file if we have a connection and no active file. */
 export function processTransferQueue() {
-    if (transferQueue.length === 0 || chunksInFlight >= MAX_CHUNKS_IN_FLIGHT) {
-        return;
-    }
+    if (activeFileId || transferQueue.length === 0) return;
+    if (!isConnected()) return; // will be pumped again on connect
 
-    // Check if we have a connection before trying to send
-    if (!connectionManager || !connectionManager.isConnected()) {
-        console.log('Cannot process transfer queue: No connection');
-        return;
-    }
+    const fileId = transferQueue.find(id => filesToSend.get(id)?.status === 'queued');
+    if (!fileId) return;
+    const f = filesToSend.get(fileId);
+    if (!f) { transferQueue = transferQueue.filter(id => id !== fileId); return processTransferQueue(); }
 
-    const { fileId, file } = transferQueue[0];
-
-    // Start sending this file
-    sendFileMetadata(fileId, file);
-}
-
-/**
- * Send file metadata to peer
- * @param {string} fileId - File ID
- * @param {File} file - File object
- */
-function sendFileMetadata(fileId, file) {
-    const fileInfo = fileManager.getFileToSend(fileId);
-    if (!fileInfo) return;
-
-    // Update file status
-    fileManager.updateFileStatus(fileId, 'send', { status: 'sending' });
-
-    // Send metadata message
-    sendMessage({
-        type: 'file-metadata',
-        fileId: fileId,
-        name: file.name,
-        size: file.size,
-        fileType: file.type,
-        chunks: Math.ceil(file.size / CHUNK_SIZE)
+    activeFileId = fileId;
+    startSending(f).catch(err => {
+        console.error('Send failed:', err);
+        f.status = 'error';
+        f.error = err.message || String(err);
+        notifyStatus(fileId, 'send');
+        finishActiveFile(fileId);
     });
-
-    // Start sending chunks
-    sendFileChunks(fileId, file);
 }
 
-/**
- * Send file chunks to peer
- * @param {string} fileId - File ID
- * @param {File} file - File object
- */
-function sendFileChunks(fileId, file) {
-    const fileInfo = fileManager.getFileToSend(fileId);
-    if (!fileInfo) return;
-
-    // Reset sending state
-    fileInfo.sentChunks = 0;
-
-    // Start sending chunks
-    continueSendingChunks(fileId);
+function stopped(f) {
+    return !f || f.status === 'cancelled' || f.status === 'paused';
 }
 
-/**
- * Send a single file chunk
- * @param {string} fileId - File ID
- * @param {number} chunkIndex - Chunk index
- * @param {Blob} chunk - Chunk data
- */
-function sendFileChunk(fileId, chunkIndex, chunk) {
-    // Read chunk as array buffer
-    const reader = new FileReader();
+/** Pre-hash all chunks (progress reported), compute Merkle root, send metadata. */
+async function startSending(f) {
+    if (stopped(f)) return;
 
-    reader.onerror = (e) => {
-        console.error(`Error reading chunk ${chunkIndex} for file ${fileId}:`, e);
-        chunksInFlight--;
+    if (!f.hashes) {
+        f.status = 'hashing';
+        f.progress = 0;
+        notifyStatus(f.fileId, 'send');
 
-        // Remove from pending chunks
-        const chunkKey = `${fileId}-${chunkIndex}`;
-        pendingChunks.delete(chunkKey);
+        const hashes = new Array(f.chunks);
+        for (let i = 0; i < f.chunks; i++) {
+            if (stopped(f)) return;
+            const offset = i * CHUNK_SIZE;
+            const end = Math.min(offset + CHUNK_SIZE, f.size);
+            const slice = await f.file.slice(offset, end).arrayBuffer();
+            if (stopped(f)) return;
+            hashes[i] = await sha256(slice);
+            if (stopped(f)) return;
+            f.progress = Math.floor(((i + 1) / f.chunks) * 100);
+            notifyStatus(f.fileId, 'send');
+        }
 
-        // Update file status to error
-        fileManager.updateFileStatus(fileId, 'send', {
-            status: 'error - read failed'
+        if (stopped(f)) return;
+        f.hashes = hashes;
+        f.rootHash = await merkleRoot(hashes);
+        if (stopped(f)) return;
+    }
+
+    f.status = 'sending';
+    f.progress = f.chunks ? Math.floor((f.ackedChunks / f.chunks) * 100) : 0;
+    notifyStatus(f.fileId, 'send');
+
+    if (!f.metadataSent) {
+        const sent = sendMessage({
+            type: 'file-metadata',
+            fileId: f.fileId,
+            fileIndex: f.fileIndex,
+            name: f.name,
+            size: f.size,
+            fileType: f.type,
+            chunks: f.chunks,
+            rootHash: Array.from(f.rootHash), // JSON-safe
         });
-    };
+        if (!sent) throw new Error('no connection');
+        f.metadataSent = true;
+    }
 
-    reader.onload = (e) => {
-        const arrayBuffer = e.target.result;
-
-        // Check if we have a connection
-        if (!connectionManager || !connectionManager.isConnected()) {
-            console.error(`Cannot send chunk ${chunkIndex}: No connection`);
-            chunksInFlight--;
-
-            // Remove from pending chunks
-            const chunkKey = `${fileId}-${chunkIndex}`;
-            pendingChunks.delete(chunkKey);
-
-            // Update file status to error
-            fileManager.updateFileStatus(fileId, 'send', {
-                status: 'error - no connection'
-            });
-            return;
-        }
-
-        // Convert ArrayBuffer to base64 for reliable transmission
-        const uint8Array = new Uint8Array(arrayBuffer);
-        let binaryString = '';
-        for (let i = 0; i < uint8Array.length; i++) {
-            binaryString += String.fromCharCode(uint8Array[i]);
-        }
-        const base64Data = btoa(binaryString);
-
-        // Create message with base64 encoded chunk
-        const message = {
-            type: 'file-chunk',
-            fileId: fileId,
-            chunkIndex: chunkIndex,
-            chunkSize: arrayBuffer.byteLength,
-            chunk: base64Data
-        };
-
-        // Send the message
-        const sent = sendMessage(message);
-        if (!sent) {
-            console.error(`Failed to send chunk ${chunkIndex} for file ${fileId}`);
-            chunksInFlight--;
-
-            // Remove from pending chunks
-            const chunkKey = `${fileId}-${chunkIndex}`;
-            pendingChunks.delete(chunkKey);
-
-            // Update file status to error
-            fileManager.updateFileStatus(fileId, 'send', {
-                status: 'error - send failed'
-            });
-            return;
-        }
-
-        console.log(`Sent chunk ${chunkIndex} for file ${fileId} (${arrayBuffer.byteLength} bytes, base64: ${base64Data.length} chars)`);
-    };
-
-    reader.readAsArrayBuffer(chunk);
+    pumpChunks(f);
 }
 
-/**
- * Handle message from peer
- * @param {object} message - Message object
- */
+/** Send as many chunks as the window allows. */
+function pumpChunks(f) {
+    if (f.status !== 'sending') return;
+    while (chunksInFlight < windowSize && f.sentChunks < f.chunks) {
+        const chunkIndex = f.sentChunks;
+        const offset = chunkIndex * CHUNK_SIZE;
+        const end = Math.min(offset + CHUNK_SIZE, f.size);
+
+        sendChunkAsync(f, chunkIndex, end - offset).catch(err => {
+            console.error('Chunk read failed:', err);
+            chunksInFlight--;
+            pendingChunks.delete(`${f.fileId}:${chunkIndex}`);
+            if (f.status !== 'cancelled') {
+                f.status = 'error';
+                f.error = 'read failed';
+                notifyStatus(f.fileId, 'send');
+            }
+        });
+
+        pendingChunks.set(`${f.fileId}:${chunkIndex}`, { sentAt: Date.now() });
+        chunksInFlight++;
+        f.sentChunks++;
+    }
+}
+
+async function sendChunkAsync(f, chunkIndex, length) {
+    const slice = await f.file.slice(chunkIndex * CHUNK_SIZE, chunkIndex * CHUNK_SIZE + length).arrayBuffer();
+    if (!isConnected()) throw new Error('no connection');
+
+    const frame = buildFrame(f.fileIndex, chunkIndex, f.hashes[chunkIndex], slice);
+    const sent = sendBinary(frame);
+    if (!sent) throw new Error('send failed');
+}
+
+function handleChunkAck(message) {
+    const { fileId, chunkIndex } = message;
+    const key = `${fileId}:${chunkIndex}`;
+    if (!pendingChunks.has(key)) return; // duplicate/stale ack
+    pendingChunks.delete(key);
+    chunksInFlight--;
+
+    const f = filesToSend.get(fileId);
+    if (!f) return;
+
+    f.ackedChunks++;
+    sampleBytes(fileId, 'send', CHUNK_SIZE);
+    adaptWindow();
+
+    if (f.ackedChunks >= f.chunks) {
+        sendMessage({ type: 'file-complete', fileId });
+        f.status = 'complete';
+        f.progress = 100;
+        notifyStatus(fileId, 'send');
+        finishActiveFile(fileId);
+    } else {
+        f.progress = Math.floor((f.ackedChunks / f.chunks) * 100);
+        notifyStatus(fileId, 'send');
+        pumpChunks(f);
+    }
+}
+
+/** Grow/shrink the in-flight window based on how fast ACKs are coming back. */
+function adaptWindow() {
+    if (pendingChunks.size === 0 && chunksInFlight < windowSize) {
+        // Batch fully drained quickly -> we can push more.
+        windowSize = Math.min(32, windowSize + 4);
+    } else if (chunksInFlight >= windowSize && pendingChunks.size > windowSize / 2) {
+        windowSize = Math.max(4, windowSize - 2);
+    }
+}
+
+function finishActiveFile(fileId) {
+    if (activeFileId === fileId) activeFileId = null;
+    transferQueue = transferQueue.filter(id => id !== fileId);
+    processTransferQueue();
+}
+
+// --- Receiver side ---------------------------------------------------------------
 export function handleMessage(message) {
     if (!message || !message.type) return;
 
     switch (message.type) {
         case 'file-metadata':
-            console.log('Received file metadata:', message);
-            // Add file to received files
-            fileManager.addReceivedFile(message.fileId, {
-                name: message.name,
-                size: message.size,
-                type: message.fileType || 'application/octet-stream',
-                chunks: message.chunks
-            });
+            handleMetadata(message);
             break;
-
-        case 'file-chunk':
-            handleFileChunk(message);
-            break;
-
         case 'chunk-ack':
-            handleChunkAcknowledgment(message);
+            handleChunkAck(message);
             break;
-
         case 'file-complete':
-            console.log('Received file complete message:', message);
-            assembleAndSaveFile(message.fileId);
+            assembleAndSaveFile(message.fileId).catch(err => {
+                console.error('Assembly failed:', err);
+                const f = receivedFiles.get(message.fileId);
+                if (f) {
+                    f.status = 'error';
+                    f.error = 'assembly failed';
+                    notifyStatus(f.fileId, 'receive');
+                }
+            });
+            break;
+        case 'file-cancelled':
+            handleCancelled(message.fileId);
             break;
     }
 }
 
-/**
- * Handle chunk acknowledgment
- * @param {object} message - Acknowledgment message
- */
-function handleChunkAcknowledgment(message) {
-    const { fileId, chunkIndex } = message;
-    const chunkKey = `${fileId}-${chunkIndex}`;
+function handleMetadata(meta) {
+    const fileId = meta.fileId;
+    if (receivedFiles.has(fileId)) return; // duplicate metadata
 
-    // Remove from pending chunks
-    if (pendingChunks.has(chunkKey)) {
-        pendingChunks.delete(chunkKey);
-    }
-
-    // Decrement chunks in flight
-    chunksInFlight--;
-
-    // Update file info
-    const fileInfo = fileManager.getFileToSend(fileId);
-    if (fileInfo) {
-        // Initialize acknowledgedChunks if not already done
-        if (!fileInfo.acknowledgedChunks) {
-            fileInfo.acknowledgedChunks = 0;
-        }
-        
-        fileInfo.acknowledgedChunks++;
-        
-        // Update progress percentage
-        const progress = Math.floor((fileInfo.acknowledgedChunks / fileInfo.chunks) * 100);
-        fileManager.updateFileStatus(fileId, 'send', {
-            acknowledgedChunks: fileInfo.acknowledgedChunks,
-            progress: progress,
-            status: 'sending'
-        });
-
-        console.log(`Chunk ${chunkIndex} acknowledged for file ${fileId}, progress: ${fileInfo.acknowledgedChunks}/${fileInfo.chunks} (${progress}%)`);
-
-        // Check if all chunks have been acknowledged
-        if (fileInfo.acknowledgedChunks === fileInfo.chunks) {
-            console.log(`All chunks acknowledged for file ${fileId}, sending file-complete`);
-
-            // Send file complete message
-            sendMessage({
-                type: 'file-complete',
-                fileId: fileId
-            });
-
-            // Mark file as complete
-            fileManager.completeFile(fileId, 'send');
-
-            // Remove from transfer queue
-            transferQueue = transferQueue.filter(item => item.fileId !== fileId);
-
-            // Process next file in queue
-            if (transferQueue.length > 0) {
-                processTransferQueue();
-            }
-        } else {
-            // Continue sending chunks if we were paused and have capacity
-            if (chunksInFlight < MAX_CHUNKS_IN_FLIGHT) {
-                continueSendingChunks(fileId);
-            }
-        }
-    }
-}
-
-/**
- * Continue sending chunks for a file
- * @param {string} fileId - File ID to continue sending
- */
-function continueSendingChunks(fileId) {
-    const fileInfo = fileManager.getFileToSend(fileId);
-    if (!fileInfo || !fileInfo.file) {
-        console.log(`Cannot continue sending chunks for ${fileId}: file not found`);
-        return;
-    }
-
-    // Check if we need to send more chunks
-    const nextChunkIndex = fileInfo.sentChunks;
-    if (nextChunkIndex >= fileInfo.chunks) {
-        console.log(`All chunks already sent for file ${fileId}`);
-        return;
-    }
-
-    // Check connection
-    if (!connectionManager || !connectionManager.isConnected()) {
-        console.log(`Cannot continue sending chunks for ${fileId}: no connection`);
-        return;
-    }
-
-    // Continue sending chunks from where we left off
-    const file = fileInfo.file;
-    const CHUNK_SIZE = 64 * 1024;
-
-    while (chunksInFlight < MAX_CHUNKS_IN_FLIGHT && fileInfo.sentChunks < fileInfo.chunks) {
-        const chunkIndex = fileInfo.sentChunks;
-        const offset = chunkIndex * CHUNK_SIZE;
-        const end = Math.min(offset + CHUNK_SIZE, file.size);
-        const chunk = file.slice(offset, end);
-
-        // Send this chunk
-        sendFileChunk(fileId, chunkIndex, chunk);
-
-        // Track this chunk
-        pendingChunks.set(`${fileId}-${chunkIndex}`, {
-            fileId,
-            chunkIndex,
-            timestamp: Date.now()
-        });
-
-        // Update counters
-        fileInfo.sentChunks++;
-        chunksInFlight++;
-
-        // Update file status
-        fileManager.updateFileStatus(fileId, 'send', {
-            sentChunks: fileInfo.sentChunks,
-            status: 'sending'
-        });
-    }
-}
-
-/**
- * Handle file chunk from peer
- * @param {object} data - Chunk data
- */
-export function handleFileChunk(data) {
-    const { fileId, chunkIndex, chunk, chunkSize } = data;
-
-    console.log(`Received chunk ${chunkIndex} for file ${fileId}:`, {
-        chunkType: typeof chunk,
-        chunkConstructor: chunk?.constructor?.name,
-        chunkSize: chunk?.byteLength || chunk?.length || chunkSize || 'unknown',
-        expectedSize: chunkSize,
-        isBase64String: typeof chunk === 'string'
+    receivedFiles.set(fileId, {
+        fileId,
+        fileIndex: meta.fileIndex,
+        name: meta.name,
+        size: meta.size,
+        type: meta.fileType || 'application/octet-stream',
+        chunks: meta.chunks,
+        rootHash: new Uint8Array(meta.rootHash),
+        status: 'receiving',
+        progress: 0,
+        receivedChunks: 0,
+        buffer: new Map(),      // chunkIndex -> Uint8Array payload
+        leafHashes: new Array(meta.chunks).fill(null),
+        verified: null,         // true/false once complete
+        error: null,
     });
+    indexToReceivedId.set(meta.fileIndex, fileId);
+    if (fileManager && fileManager.addReceivedFile) {
+        fileManager.addReceivedFile(fileId, {
+            name: meta.name,
+            size: meta.size,
+            type: meta.fileType || 'application/octet-stream',
+        });
+    }
+    callbacks.onIncoming?.(fileId, meta);
+    notifyStatus(fileId, 'receive');
+}
 
-    // Get file info
-    const fileInfo = fileManager.getReceivedFile(fileId);
-    if (!fileInfo) {
-        console.error(`Received chunk for unknown file: ${fileId}`);
+/** Handle an incoming binary chunk frame. */
+export async function handleBinaryFrame(data) {
+    let u8 = data;
+    if (data instanceof Blob) {
+        try { u8 = new Uint8Array(await data.arrayBuffer()); } catch { return; }
+    }
+    const frame = parseFrame(u8);
+    if (!frame) return;
+
+    const fileId = indexToReceivedId.get(frame.fileIndex);
+    const f = fileId ? receivedFiles.get(fileId) : null;
+    if (!f || f.status !== 'receiving') return; // unknown or already finished/cancelled
+    if (f.buffer.has(frame.chunkIndex)) return;
+
+    let hashOk = false;
+    try {
+        hashOk = await verifyChunkHash(frame.hash, frame.payload);
+    } catch (err) {
+        console.warn('Chunk hash verification failed:', err);
+    }
+    if (!hashOk) {
+        f.status = 'error';
+        f.error = 'checksum mismatch';
+        notifyStatus(f.fileId, 'receive');
+        sendMessage({ type: 'chunk-ack', fileId, chunkIndex: frame.chunkIndex });
         return;
     }
 
-    // Convert chunk to Uint8Array properly
-    let chunkArray;
-    if (chunk instanceof ArrayBuffer) {
-        chunkArray = new Uint8Array(chunk);
-    } else if (chunk instanceof Uint8Array) {
-        chunkArray = chunk;
-    } else if (typeof chunk === 'string') {
-        // Decode base64 string to binary data
-        try {
-            console.log(`Decoding base64 chunk ${chunkIndex} (${chunk.length} chars)`);
-            const binaryString = atob(chunk);
-            chunkArray = new Uint8Array(binaryString.length);
-            for (let i = 0; i < binaryString.length; i++) {
-                chunkArray[i] = binaryString.charCodeAt(i);
-            }
-            console.log(`Decoded chunk ${chunkIndex} to ${chunkArray.length} bytes`);
-        } catch (error) {
-            console.error(`Error decoding base64 chunk ${chunkIndex}:`, error);
+    f.buffer.set(frame.chunkIndex, frame.payload);
+    f.leafHashes[frame.chunkIndex] = frame.hash;
+    f.receivedChunks++;
+    sampleBytes(fileId, 'receive', frame.payload.byteLength);
+    f.progress = Math.floor((f.receivedChunks / f.chunks) * 100);
+
+    sendMessage({ type: 'chunk-ack', fileId, chunkIndex: frame.chunkIndex });
+    notifyStatus(fileId, 'receive');
+}
+
+async function verifyChunkHash(expected, payload) {
+    const actual = await sha256(payload);
+    return bytesEqual(actual, expected);
+}
+
+function bytesEqual(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+}
+
+async function assembleAndSaveFile(fileId) {
+    const f = receivedFiles.get(fileId);
+    if (!f || f.status === 'complete' || f.status === 'cancelled') return;
+    if (f.status === 'error') return; // already failed integrity check
+
+    for (let i = 0; i < f.chunks; i++) {
+        if (!f.buffer.has(i)) {
+            f.status = 'error';
+            f.error = `missing chunks (${f.receivedChunks}/${f.chunks})`;
+            notifyStatus(fileId, 'receive');
             return;
         }
-    } else {
-        console.error('Unknown chunk type:', typeof chunk, chunk);
-        return;
     }
 
-    // Verify chunk size if provided
-    if (chunkSize && chunkArray.length !== chunkSize) {
-        console.warn(`Chunk size mismatch: expected ${chunkSize}, got ${chunkArray.length}`);
+    const parts = [];
+    for (let i = 0; i < f.chunks; i++) parts.push(f.buffer.get(i));
+    const blob = new Blob(parts, { type: f.type });
+    f.buffer.clear(); // free chunk memory early
+
+    if (blob.size !== f.size) {
+        console.warn(`Blob size mismatch for ${fileId}: expected ${f.size}, got ${blob.size}`);
     }
 
-    console.log(`Storing chunk ${chunkIndex} with size ${chunkArray.length} bytes`);
-
-    // Store the chunk in the file's buffer
-    fileInfo.buffer.set(chunkIndex, chunkArray);
-    fileInfo.receivedChunks++;
-
-    // Send acknowledgment
-    sendMessage({
-        type: 'chunk-ack',
-        fileId: fileId,
-        chunkIndex: chunkIndex
-    });
-
-    // Update progress
-    const progress = Math.floor((fileInfo.receivedChunks / fileInfo.chunks) * 100);
-    fileManager.updateFileStatus(fileId, 'receive', {
-        receivedChunks: fileInfo.receivedChunks,
-        progress: progress,
-        status: 'receiving'
-    });
-
-    console.log(`File ${fileId} progress: ${fileInfo.receivedChunks}/${fileInfo.chunks} chunks (${progress}%)`);
-
-    // Check if we've received all chunks
-    if (fileInfo.receivedChunks === fileInfo.chunks) {
-        console.log(`Received all chunks for file ${fileId}`);
-        // We'll wait for the file-complete message before assembling
-    }
-}
-
-/**
- * Assemble and save a completed file
- * @param {string} fileId - File ID
- */
-export function assembleAndSaveFile(fileId) {
-    const fileInfo = fileManager.getReceivedFile(fileId);
-    if (!fileInfo || fileInfo.completed) return;
-
-    console.log(`Assembling file ${fileId}`, {
-        receivedChunks: fileInfo.receivedChunks,
-        totalChunks: fileInfo.chunks,
-        fileType: fileInfo.type,
-        fileName: fileInfo.name
-    });
-
-    // Check if we have all chunks
-    if (fileInfo.receivedChunks !== fileInfo.chunks) {
-        console.error(`Cannot assemble file ${fileId}: missing chunks (${fileInfo.receivedChunks}/${fileInfo.chunks})`);
-        return;
-    }
-
-    // Verify all chunks are present
-    const missingChunks = [];
-    for (let i = 0; i < fileInfo.chunks; i++) {
-        if (!fileInfo.buffer.has(i)) {
-            missingChunks.push(i);
-        }
-    }
-
-    if (missingChunks.length > 0) {
-        console.error(`Cannot assemble file ${fileId}: missing chunk indices:`, missingChunks);
-        return;
-    }
-
+    // Verify Merkle root over the leaf hashes we collected.
     try {
-        // Create an array to hold all chunks in order
-        const chunks = [];
-        let totalSize = 0;
-
-        // Add chunks in order and calculate total size
-        for (let i = 0; i < fileInfo.chunks; i++) {
-            const chunk = fileInfo.buffer.get(i);
-            if (chunk && chunk instanceof Uint8Array) {
-                chunks.push(chunk);
-                totalSize += chunk.length;
-            } else {
-                console.error(`Invalid chunk at index ${i} for file ${fileId}:`, chunk);
-                return;
-            }
+        const leaves = [];
+        for (let i = 0; i < f.chunks; i++) {
+            if (!f.leafHashes[i]) throw new Error('missing leaf hash');
+            leaves.push(f.leafHashes[i]);
         }
+        const root = await merkleRoot(leaves);
+        f.verified = bytesEqual(root, f.rootHash);
+    } catch (err) {
+        f.verified = false;
+    }
 
-        console.log(`Assembling ${chunks.length} chunks, total size: ${totalSize} bytes, expected: ${fileInfo.size} bytes`);
+    f.status = 'complete';
+    f.progress = 100;
+    if (!f.verified) f.error = 'integrity check failed';
+    notifyStatus(fileId, 'receive');
 
-        // Determine the correct MIME type
-        let mimeType = fileInfo.type;
-        if (!mimeType || mimeType === 'application/octet-stream') {
-            // Try to determine MIME type from file extension
-            mimeType = getMimeTypeFromFileName(fileInfo.name) || 'application/octet-stream';
-        }
-
-        console.log(`Creating blob with MIME type: ${mimeType}`);
-
-        // Create a blob from all chunks with proper MIME type
-        const blob = new Blob(chunks, { type: mimeType });
-
-        // Verify blob size
-        if (blob.size !== fileInfo.size) {
-            console.warn(`Blob size mismatch: expected ${fileInfo.size}, got ${blob.size}`);
-        }
-
-        // Mark file as complete
-        fileInfo.completed = true;
-        fileManager.completeFile(fileId, 'receive', { blob });
-
-        console.log(`File ${fileId} assembled successfully:`, {
-            name: fileInfo.name,
-            size: blob.size,
-            type: mimeType
-        });
-
-    } catch (error) {
-        console.error(`Error assembling file ${fileId}:`, error);
-        fileManager.updateFileStatus(fileId, 'receive', {
-            status: 'error - assembly failed'
-        });
-        return;
-    } finally {
-        // Clear buffer to free memory
-        fileInfo.buffer.clear();
+    // Hand the blob to the file manager for download handling.
+    if (fileManager && fileManager.completeReceivedFile) {
+        fileManager.completeReceivedFile(fileId, blob);
     }
 }
 
-/**
- * Get MIME type from file name
- * @param {string} fileName - File name
- * @returns {string|null} MIME type or null
- */
-function getMimeTypeFromFileName(fileName) {
-    const extension = fileName.split('.').pop()?.toLowerCase();
-    if (!extension) return null;
-
-    const mimeTypes = {
-        // Images
-        'jpg': 'image/jpeg',
-        'jpeg': 'image/jpeg',
-        'png': 'image/png',
-        'gif': 'image/gif',
-        'svg': 'image/svg+xml',
-        'webp': 'image/webp',
-        'bmp': 'image/bmp',
-        'ico': 'image/x-icon',
-
-        // Documents
-        'pdf': 'application/pdf',
-        'doc': 'application/msword',
-        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'xls': 'application/vnd.ms-excel',
-        'xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'ppt': 'application/vnd.ms-powerpoint',
-        'pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'txt': 'text/plain',
-        'rtf': 'application/rtf',
-
-        // Archives
-        'zip': 'application/zip',
-        'rar': 'application/vnd.rar',
-        '7z': 'application/x-7z-compressed',
-        'tar': 'application/x-tar',
-        'gz': 'application/gzip',
-
-        // Code/Text
-        'html': 'text/html',
-        'css': 'text/css',
-        'js': 'text/javascript',
-        'json': 'application/json',
-        'xml': 'text/xml',
-        'csv': 'text/csv',
-
-        // Audio
-        'mp3': 'audio/mpeg',
-        'wav': 'audio/wav',
-        'ogg': 'audio/ogg',
-        'flac': 'audio/flac',
-        'm4a': 'audio/mp4',
-
-        // Video
-        'mp4': 'video/mp4',
-        'avi': 'video/x-msvideo',
-        'mov': 'video/quicktime',
-        'wmv': 'video/x-ms-wmv',
-        'flv': 'video/x-flv',
-        'webm': 'video/webm',
-        'mkv': 'video/x-matroska'
-    };
-
-    return mimeTypes[extension] || null;
+function handleCancelled(fileId) {
+    const f = receivedFiles.get(fileId);
+    if (!f) return;
+    f.status = 'cancelled';
+    f.error = null;
+    f.buffer.clear();
+    notifyStatus(fileId, 'receive');
 }
 
-/**
- * Retry sending a file
- * @param {string} fileId - File ID
- */
-export function retryFile(fileId) {
-    const fileInfo = fileManager.getFileToSend(fileId);
-    if (!fileInfo) return;
+// --- Controls -------------------------------------------------------------------
+export function pauseFile(fileId) {
+    const f = filesToSend.get(fileId);
+    if (!f || !['sending', 'hashing', 'queued'].includes(f.status)) return;
+    f.status = 'paused';
+    notifyStatus(fileId, 'send');
+}
 
-    // Reset file status
-    fileManager.updateFileStatus(fileId, 'send', {
-        status: 'pending',
-        progress: 0,
-        sentChunks: 0,
-        acknowledgedChunks: 0
-    });
-
-    // Add to transfer queue
-    transferQueue.push({
-        fileId,
-        file: fileInfo.file
-    });
-
-    // Process the queue
+export function resumeFile(fileId) {
+    const f = filesToSend.get(fileId);
+    if (!f || f.status !== 'paused') return;
+    if (!isConnected()) return; // stays paused until connection returns
+    f.status = 'queued';
+    notifyStatus(fileId, 'send');
+    if (activeFileId === fileId) activeFileId = null;
     processTransferQueue();
+}
+
+export function cancelFile(fileId) {
+    const f = filesToSend.get(fileId);
+    if (!f || ['complete', 'cancelled'].includes(f.status)) return;
+
+    // Drop in-flight tracking for this file.
+    for (const key of [...pendingChunks.keys()]) {
+        if (key.startsWith(`${fileId}:`)) {
+            pendingChunks.delete(key);
+            chunksInFlight--;
+        }
+    }
+
+    f.status = 'cancelled';
+    notifyStatus(fileId, 'send');
+
+    sendMessage({ type: 'file-cancelled', fileId });
+
+    transferQueue = transferQueue.filter(id => id !== fileId);
+    finishActiveFile(fileId);
+}
+
+/** Start a fresh send of a file that failed, was cancelled, or already completed. */
+export function retryFile(fileId) {
+    const f = filesToSend.get(fileId);
+    if (!f || !['error', 'cancelled', 'complete'].includes(f.status)) return;
+    if (!f.file) return;
+    handleFiles([f.file]);
+}
+
+// --- Status bridge to file manager -------------------------------------------------
+function notifyStatus(fileId, direction) {
+    if (!fileManager || !fileManager.updateFileStatus) return;
+    const f = direction === 'send' ? filesToSend.get(fileId) : receivedFiles.get(fileId);
+    if (!f) return;
+    fileManager.updateFileStatus(fileId, direction, {
+        status: f.status,
+        progress: f.progress,
+        error: f.error || null,
+        verified: 'verified' in f ? f.verified : undefined,
+    });
 }
