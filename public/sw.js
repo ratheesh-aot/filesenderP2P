@@ -10,7 +10,7 @@
  * fully functional offline after the first visit.
  */
 
-const CACHE_NAME = 'filesender-v9';
+const CACHE_NAME = 'filesender-v10';
 const STATIC_ASSETS = [
     '/',
     '/manifest.webmanifest',

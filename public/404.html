@@ -3,67 +3,52 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>404 - Page Not Found</title>
+    <title>Page not found — Sendee.xyz</title>
+    <meta name="theme-color" content="#060e16">
+    <link rel="icon" href="icons/icon-192.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600&display=swap">
     <style>
         body {
-            font-family: 'Comic Sans MS', 'Chalkboard SE', 'Marker Felt', sans-serif;
-            background-color: #f0f8ff;
-            color: #333;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            min-height: 100vh;
             margin: 0;
-            text-align: center;
+            min-height: 100vh;
+            display: grid;
+            place-items: center;
+            padding: 24px;
+            font-family: Outfit, 'Segoe UI', sans-serif;
+            color: #eef8fb;
+            background:
+                radial-gradient(720px 360px at 100% -10%, rgba(34, 240, 255, 0.12), transparent 60%),
+                #060e16;
         }
-        .container {
-            background-color: #fff;
-            padding: 30px 40px;
-            border-radius: 25px;
-            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
-            max-width: 500px;
-            width: 100%;
-            border: 5px dashed #ffcc00;
+        .panel {
+            width: min(420px, 100%);
+            padding: 28px 24px;
+            text-align: left;
+            background: #0c1824;
+            border: 1px solid #1c3344;
+            border-radius: 18px;
         }
-        h1 {
-            color: #ff6347;
-            font-size: 3em;
-            margin-bottom: 10px;
-        }
-        p {
-            font-size: 1.2em;
-            margin-bottom: 20px;
-        }
+        img { width: 52px; height: 52px; display: block; }
+        h1 { margin: 16px 0 8px; font-size: 1.6rem; letter-spacing: -0.04em; }
+        p { margin: 0 0 20px; color: #8eafc0; }
         a {
             display: inline-block;
-            padding: 10px 20px;
-            background-color: #4caf50;
-            color: white;
+            padding: 10px 14px;
+            border-radius: 10px;
+            background: #3ec0ff;
+            color: #041820;
+            font-weight: 600;
             text-decoration: none;
-            border-radius: 5px;
-            font-weight: bold;
-            transition: background-color 0.3s;
         }
-        a:hover {
-            background-color: #388e3c;
-        }
-        .emoji {
-            font-size: 5em;
-            margin-bottom: 20px;
-            animation: bounce 1s infinite alternate;
-        }
-        @keyframes bounce {
-            from { transform: translateY(0); }
-            to   { transform: translateY(-10px); }
-        }
+        a:focus-visible { outline: 2px solid #22f0ff; outline-offset: 3px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="emoji">😕</div>
+    <div class="panel">
+        <img src="icons/icon-192.svg" alt="">
         <h1>404</h1>
-        <p>Oops! The page you're looking for couldn't be found.</p>
-        <a href="/">Go Back Home</a>
+        <p>The page you're looking for couldn't be found.</p>
+        <a href="/">Go back home</a>
     </div>
 </body>
 </html>

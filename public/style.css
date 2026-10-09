@@ -1,42 +1,50 @@
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@400;500;600;700&display=swap');
 
-/* A desk for handing a file to another device.
-   One copper trace marks live movement. Everything else stays quiet. */
+/* Navy field, cyan in flight, teal when it lands.
+   Colors sampled from the brand tiles in /assets. */
 :root {
-    --paper: #e7ecef;
-    --card: #f7f8f9;
-    --ink: #1b242c;
-    --muted: #5c6b76;
-    --line: #d5dee4;
+    --paper: #e7f3f7;
+    --card: #f7fbfd;
+    --ink: #071526;
+    --muted: #4c6574;
+    --line: #d3e3ec;
     --fill: #ffffff;
-    --send: #1d4e89;
-    --receive: #1a6b58;
-    --wire: #c4552a;
-    --danger: #9d2c2c;
-    --ok: #1a6b58;
-    --shadow: 0 18px 40px rgba(27, 36, 44, 0.08);
-    --icon-bg: #e7eef3;
-    --track: #e1e8ed;
-    --chip: #eef3f6;
+    --navy: #07131c;
+    --send: #0068b3;
+    --receive: #0b7276;
+    --wire: #087488;
+    --danger: #b4232c;
+    --ok: #0b7276;
+    --shadow: 0 18px 40px rgba(7, 19, 28, 0.08);
+    --icon-bg: #e3f4f8;
+    --track: #d5e7ee;
+    --chip: #eef6f9;
+    --wash: rgba(0, 176, 214, 0.16);
+    --wash-2: rgba(11, 114, 118, 0.10);
+    --on-send: #ffffff;
     color-scheme: light;
 }
 
 [data-theme="dark"] {
-    --paper: #12181e;
-    --card: #1a222b;
-    --ink: #e8eef2;
-    --muted: #9aabb6;
-    --line: #2c3944;
-    --fill: #222c36;
-    --send: #8eb4de;
-    --receive: #7dcebb;
-    --wire: #e08a62;
-    --danger: #f0a3a0;
-    --ok: #7dcebb;
-    --shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
-    --icon-bg: #2a3642;
-    --track: #2c3944;
-    --chip: #2a3642;
+    --paper: #060e16;
+    --card: #0c1824;
+    --ink: #eef8fb;
+    --muted: #8eafc0;
+    --line: #1c3344;
+    --fill: #102232;
+    --navy: #07131c;
+    --send: #3ec0ff;
+    --receive: #2ed3c8;
+    --wire: #22f0ff;
+    --danger: #ff9b96;
+    --ok: #2ed3c8;
+    --shadow: 0 18px 40px rgba(0, 0, 0, 0.4);
+    --icon-bg: #143044;
+    --track: #1a3344;
+    --chip: #143044;
+    --wash: rgba(34, 240, 255, 0.10);
+    --wash-2: rgba(46, 211, 200, 0.08);
+    --on-send: #041820;
     color-scheme: dark;
 }
 
@@ -50,7 +58,10 @@ body {
     font-size: 16px;
     line-height: 1.45;
     color: var(--ink);
-    background: var(--paper);
+    background-color: var(--paper);
+    background-image:
+        radial-gradient(920px 440px at 100% -12%, var(--wash), transparent 60%),
+        radial-gradient(720px 400px at -12% 110%, var(--wash-2), transparent 55%);
 }
 
 .container {
@@ -95,6 +106,7 @@ body {
 }
 
 .brand-mark {
+    display: block;
     width: 38px;
     height: 38px;
     flex: none;
@@ -128,7 +140,7 @@ body {
     font-size: 0.62em;
     font-weight: 500;
     letter-spacing: -0.04em;
-    color: var(--wire);
+    color: var(--receive);
 }
 
 .status-pill {
@@ -224,18 +236,22 @@ body {
     font-size: 0.92rem;
 }
 
+.role-receive .role-icon { color: var(--receive); }
+
 .role-send {
-    background: var(--ink);
-    color: var(--card);
-    border-color: var(--ink);
+    background: var(--navy);
+    color: #f4fbfe;
+    border-color: var(--navy);
 }
 
 .role-send .role-icon {
-    background: color-mix(in srgb, var(--card) 16%, transparent);
-    color: var(--wire);
+    background: rgba(34, 240, 255, 0.14);
+    color: #22f0ff;
 }
 
-.role-send .role-hint { color: color-mix(in srgb, var(--card) 72%, transparent); }
+.role-send .role-hint { color: rgba(244, 251, 254, 0.72); }
+
+[data-theme="dark"] .role-send { border-color: #1b4e63; }
 
 .share-native {
     display: none;
@@ -245,7 +261,7 @@ body {
     border: 0;
     border-radius: 10px;
     background: var(--send);
-    color: #fff;
+    color: var(--on-send);
     font: inherit;
     font-weight: 600;
     cursor: pointer;
@@ -253,7 +269,7 @@ body {
 
 .share-native i { margin-right: 8px; }
 
-[data-theme="dark"] .share-native { color: #12202c; }
+
 
 .share-card,
 #host-info,
@@ -307,11 +323,9 @@ body {
     border: 0;
     border-radius: 10px;
     background: var(--send);
-    color: #fff;
+    color: var(--on-send);
     cursor: pointer;
 }
-
-[data-theme="dark"] #copy-button { color: #12202c; }
 
 #qrcode-container {
     display: inline-block;
@@ -390,11 +404,8 @@ body {
 #reconnect-host-button,
 .join-form button {
     background: var(--send);
-    color: #fff;
+    color: var(--on-send);
 }
-
-[data-theme="dark"] #reconnect-host-button,
-[data-theme="dark"] .join-form button { color: #12202c; }
 
 #scan-qr-button i,
 #reconnect-host-button i { margin-right: 6px; }
@@ -419,7 +430,7 @@ body {
 .scanner-backdrop {
     position: absolute;
     inset: 0;
-    background: rgba(18, 24, 30, 0.55);
+    background: rgba(6, 14, 22, 0.62);
 }
 
 .scanner-panel {
@@ -453,7 +464,7 @@ body {
     aspect-ratio: 1;
     border-radius: 12px;
     overflow: hidden;
-    background: #0e141a;
+    background: #07131c;
 }
 
 #scanner-video {
@@ -808,7 +819,7 @@ body {
 .drawer-backdrop {
     position: absolute;
     inset: 0;
-    background: rgba(18, 24, 30, 0.45);
+    background: rgba(6, 14, 22, 0.55);
 }
 
 .drawer-panel {

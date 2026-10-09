@@ -56,12 +56,16 @@ function getStoredTheme() {
     return 'system';
 }
 
+const THEME_COLORS = { light: '#e7f3f7', dark: '#060e16' };
+
 export function applyTheme(theme) {
     let effective = theme;
     if (theme === 'system') {
         effective = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
     }
     document.documentElement.dataset.theme = effective;
+    const meta = document.querySelector('meta[name="theme-color"]');
+    if (meta) meta.setAttribute('content', THEME_COLORS[effective]);
 }
 
 function setupFilterChips() {
