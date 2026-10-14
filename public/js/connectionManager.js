@@ -19,6 +19,8 @@ const RECONNECT_BASE_MS = 2000;
 const RECONNECT_MAX_MS = 30000;
 const HEARTBEAT_INTERVAL_MS = 10000;
 const PEER_TIMEOUT_MS = 25000;
+// A peer that announced it is backgrounded (e.g. native file picker open) gets this long.
+const AWAY_TIMEOUT_MS = 180000;
 
 // --- State --------------------------------------------------------------------
 let ws = null;
@@ -35,6 +37,7 @@ let joinRetryTimer = null;
 let heartbeatTimer = null;
 let lastActivityAt = Date.now();
 let peerLostNotified = false;
+let peerAwayUntil = 0;           // remote tab is backgrounded until this timestamp
 
 // --- Callbacks ------------------------------------------------------------------
 let callbacks = {
@@ -163,6 +166,10 @@ function openSocket() {
 
         socket.send(JSON.stringify({ type: 'register', peerId }));
 
+        // Signaling came back while the data channel survived (tab was backgrounded):
+        // nothing to re-negotiate, and re-joining would only disturb the live peer.
+        if (connected) return;
+
         if (hostIdFromUrl) {
             isHost = false;
             if (!connected) callbacks.onStatusUpdate('Connecting to host...', false);
@@ -187,10 +194,12 @@ function openSocket() {
 
     socket.onclose = () => {
         if (ws !== socket) return;
-        stopHeartbeat();
         clearJoinRetry();
-        teardownPeer('signaling lost');
-        callbacks.onStatusUpdate(isHost ? 'Reconnecting to server...' : 'Server connection lost, retrying...', false);
+        // The WebRTC channel does not depend on signaling once open, so keep it.
+        if (!connected) {
+            teardownPeer('signaling lost');
+            callbacks.onStatusUpdate(isHost ? 'Reconnecting to server...' : 'Server connection lost, retrying...', false);
+        }
         scheduleReconnect();
     };
 }
@@ -265,6 +274,8 @@ function handleSignalingMessage(data) {
             break;
 
         case 'client-left':
+            // A live data channel is judged by its own heartbeat, not by signaling.
+            if (connected) break;
             if (remotePeerId === data.clientId) {
                 teardownPeer('peer left');
                 if (isHost) callbacks.onStatusUpdate('Waiting for peer...', false);
@@ -272,7 +283,7 @@ function handleSignalingMessage(data) {
             break;
 
         case 'host-left':
-            if (isHost) break;
+            if (isHost || connected) break;
             teardownPeer('host left');
             callbacks.onStatusUpdate('Host disconnected, retrying...', false);
             scheduleJoinRetry();
@@ -335,6 +346,7 @@ function teardownPeer(reason, options = {}) {
         try { dying.destroy(); } catch { /* ignore */ }
     }
     remotePeerId = null;
+    peerAwayUntil = 0;
 
     if (wasConnected && !peerLostNotified && !options.silent) {
         peerLostNotified = true;
@@ -361,6 +373,7 @@ function setupPeerEvents() {
         clearJoinRetry();
         lastActivityAt = Date.now();
         peerLostNotified = false;
+        peerAwayUntil = 0;
         callbacks.onStatusUpdate('Connected to peer!', true);
         startHeartbeat();
 
@@ -396,6 +409,41 @@ function setupPeerEvents() {
     peer.on('close', () => teardownPeer('closed'));
 }
 
+// --- Page visibility ------------------------------------------------------------------
+// Mobile browsers freeze the page (and often kill the socket) while a native
+// file picker or another app is in front. Tell the peer, and recover on return.
+function handleVisibilityChange() {
+    if (document.hidden) {
+        sendMessage({ type: 'away' });
+        return;
+    }
+    handleResume();
+}
+
+function handleResume() {
+    lastActivityAt = Date.now();
+    if (connected) {
+        sendMessage({ type: 'back' });
+        sendMessage({ type: 'ping', t: Date.now() });
+    }
+    if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+        reconnectAttempts = 0;
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+        openSocket();
+    } else if (ws.readyState === WebSocket.OPEN && !connected && hostIdFromUrl && !isHost) {
+        sendJoin();
+    }
+}
+
+if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pageshow', (e) => { if (e.persisted) handleResume(); });
+    window.addEventListener('online', handleResume);
+}
+
 // --- Heartbeat ------------------------------------------------------------------------
 function toBytes(data) {
     if (data instanceof Uint8Array) return data;
@@ -412,6 +460,10 @@ function handleControlText(text) {
     try { message = JSON.parse(text); } catch { return; }
     if (message.type === 'greeting' && message.name) {
         callbacks.onPeerName(message.name);
+    } else if (message.type === 'away') {
+        peerAwayUntil = Date.now() + AWAY_TIMEOUT_MS;
+    } else if (message.type === 'back') {
+        peerAwayUntil = 0;
     } else if (message.type !== 'ping' && message.type !== 'pong') {
         callbacks.onDataReceived(JSON.stringify(message));
     }
@@ -422,7 +474,10 @@ function startHeartbeat() {
     heartbeatTimer = setInterval(() => {
         if (!connected) return;
         const idleMs = Date.now() - lastActivityAt;
-        if (idleMs > PEER_TIMEOUT_MS) {
+        // Our own timers are throttled while hidden, and a backgrounded peer
+        // announced it would be silent, so only count genuine silence.
+        const limit = Date.now() < peerAwayUntil ? AWAY_TIMEOUT_MS : PEER_TIMEOUT_MS;
+        if (!document.hidden && idleMs > limit) {
             callbacks.onStatusUpdate('Peer lost — waiting for them to return...', false);
             teardownPeer('peer-lost');
             return;

@@ -7,6 +7,8 @@ const signalHandler = require('./signalHandler');
 // Keepalive tuning: proxies (e.g. Vercel) drop idle sockets, so we ping
 // regularly and terminate connections that stop answering pongs.
 const PING_INTERVAL_MS = 30000;
+// How long a dropped peer may stay away (mobile tab backgrounded) before its rooms are torn down.
+const DISCONNECT_GRACE_MS = 45000;
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024; // signaling frames are tiny; cap at 16 MB
 
 /**
@@ -89,7 +91,7 @@ function handleConnection(ws) {
     });
     
     ws.on('close', () => {
-        handleDisconnect(clientId);
+        handleDisconnect(clientId, ws);
     });
 }
 
@@ -228,44 +230,44 @@ function handleIceCandidate(ws, data) {
 /**
  * Handle client disconnection
  * @param {string} clientId - The client ID that disconnected
+ * @param {WebSocket} ws - The socket that closed
  */
-function handleDisconnect(clientId) {
+function handleDisconnect(clientId, ws) {
     console.log('WebSocket client disconnected');
-    
-    // Remove this connection from the connections map
-    if (clientId) {
-        connectionManager.removeConnection(clientId);
-        
-        // Notify all rooms this client was in
-        for (const [hostId, clients] of roomManager.getAllRooms().entries()) {
-            if (roomManager.isClientInRoom(hostId, clientId)) {
-                roomManager.removeClientFromRoom(hostId, clientId);
-                
-                // Notify host that client left
-                const hostWs = connectionManager.getConnection(hostId);
-                if (connectionManager.isConnectionActive(hostId)) {
-                    hostWs.send(JSON.stringify({
-                        type: 'client-left',
-                        clientId: clientId
-                    }));
+    if (!clientId) return;
+
+    // A newer socket already took over this peerId: the close is stale.
+    if (connectionManager.getConnection(clientId) !== ws) return;
+    connectionManager.removeConnection(clientId);
+
+    // Give the peer a chance to come back before telling others it left.
+    const timer = setTimeout(() => cleanupPeer(clientId), DISCONNECT_GRACE_MS);
+    timer.unref?.();
+}
+
+function cleanupPeer(clientId) {
+    // Reconnected during the grace period: keep rooms intact.
+    if (connectionManager.getConnection(clientId)) return;
+
+    for (const [hostId, clients] of roomManager.getAllRooms().entries()) {
+        if (roomManager.isClientInRoom(hostId, clientId)) {
+            roomManager.removeClientFromRoom(hostId, clientId);
+
+            const hostWs = connectionManager.getConnection(hostId);
+            if (connectionManager.isConnectionActive(hostId)) {
+                hostWs.send(JSON.stringify({ type: 'client-left', clientId }));
+            }
+        }
+
+        // If this was a host, notify all clients in the room
+        if (hostId === clientId) {
+            for (const clientInRoom of clients) {
+                const clientWs = connectionManager.getConnection(clientInRoom);
+                if (connectionManager.isConnectionActive(clientInRoom)) {
+                    clientWs.send(JSON.stringify({ type: 'host-left', hostId }));
                 }
             }
-            
-            // If this was a host, notify all clients in the room
-            if (hostId === clientId) {
-                for (const clientInRoom of clients) {
-                    const clientWs = connectionManager.getConnection(clientInRoom);
-                    if (connectionManager.isConnectionActive(clientInRoom)) {
-                        clientWs.send(JSON.stringify({
-                            type: 'host-left',
-                            hostId: hostId
-                        }));
-                    }
-                }
-                
-                // Delete the room
-                roomManager.deleteRoom(hostId);
-            }
+            roomManager.deleteRoom(hostId);
         }
     }
 }

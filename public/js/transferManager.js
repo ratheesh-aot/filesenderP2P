@@ -7,9 +7,10 @@
  *      [u8 magic "FS2P"][u32 fileIndex LE][u32 chunkIndex LE][u8 flags]
  *      [u8[32] SHA-256 of payload][payload bytes...]
  *  - Chunks stay under 64 KB so they fit Chrome's default SCTP max-message-size.
- *  - Sender pre-hashes every chunk (SHA-256) and sends a Merkle root in the
- *    metadata message. Receiver verifies each chunk hash on arrival and the
- *    full Merkle root at completion -> "verified" badge.
+ *  - Sender hashes each chunk (SHA-256) just before sending it, so transfers
+ *    start immediately. The Merkle root over all chunk hashes travels in the
+ *    final file-complete message. Receiver verifies each chunk hash on arrival
+ *    and the full Merkle root at completion -> "verified" badge.
  */
 
 import { sendMessage, sendBinary } from './connectionManager.js';
@@ -219,7 +220,7 @@ export function handleFiles(fileList) {
             progress: 0,
             sentChunks: 0,
             ackedChunks: 0,
-            hashes: null,      // filled during hashing phase
+            hashes: new Array(chunks), // filled as chunks are sent
             rootHash: null,
             error: null,
             metadataSent: false,
@@ -267,33 +268,9 @@ function stopped(f) {
     return !f || f.status === 'cancelled' || f.status === 'paused';
 }
 
-/** Pre-hash all chunks (progress reported), compute Merkle root, send metadata. */
+/** Announce the file and start streaming chunks (each is hashed as it is sent). */
 async function startSending(f) {
     if (stopped(f)) return;
-
-    if (!f.hashes) {
-        f.status = 'hashing';
-        f.progress = 0;
-        notifyStatus(f.fileId, 'send');
-
-        const hashes = new Array(f.chunks);
-        for (let i = 0; i < f.chunks; i++) {
-            if (stopped(f)) return;
-            const offset = i * CHUNK_SIZE;
-            const end = Math.min(offset + CHUNK_SIZE, f.size);
-            const slice = await f.file.slice(offset, end).arrayBuffer();
-            if (stopped(f)) return;
-            hashes[i] = await sha256(slice);
-            if (stopped(f)) return;
-            f.progress = Math.floor(((i + 1) / f.chunks) * 100);
-            notifyStatus(f.fileId, 'send');
-        }
-
-        if (stopped(f)) return;
-        f.hashes = hashes;
-        f.rootHash = await merkleRoot(hashes);
-        if (stopped(f)) return;
-    }
 
     f.status = 'sending';
     f.progress = f.chunks ? Math.floor((f.ackedChunks / f.chunks) * 100) : 0;
@@ -308,7 +285,6 @@ async function startSending(f) {
             size: f.size,
             fileType: f.type,
             chunks: f.chunks,
-            rootHash: Array.from(f.rootHash), // JSON-safe
         });
         if (!sent) throw new Error('no connection');
         f.metadataSent = true;
@@ -346,7 +322,11 @@ async function sendChunkAsync(f, chunkIndex, length) {
     const slice = await f.file.slice(chunkIndex * CHUNK_SIZE, chunkIndex * CHUNK_SIZE + length).arrayBuffer();
     if (!isConnected()) throw new Error('no connection');
 
-    const frame = buildFrame(f.fileIndex, chunkIndex, f.hashes[chunkIndex], slice);
+    const hash = await sha256(slice);
+    f.hashes[chunkIndex] = hash;
+    if (!isConnected()) throw new Error('no connection');
+
+    const frame = buildFrame(f.fileIndex, chunkIndex, hash, slice);
     const sent = sendBinary(frame);
     if (!sent) throw new Error('send failed');
 }
@@ -366,16 +346,28 @@ function handleChunkAck(message) {
     adaptWindow();
 
     if (f.ackedChunks >= f.chunks) {
-        sendMessage({ type: 'file-complete', fileId });
-        f.status = 'complete';
-        f.progress = 100;
-        notifyStatus(fileId, 'send');
-        finishActiveFile(fileId);
+        completeSend(f);
     } else {
         f.progress = Math.floor((f.ackedChunks / f.chunks) * 100);
         notifyStatus(fileId, 'send');
         pumpChunks(f);
     }
+}
+
+/** All chunks acked: send the Merkle root so the receiver can verify the whole file. */
+async function completeSend(f) {
+    try {
+        f.rootHash = await merkleRoot(f.hashes);
+        sendMessage({ type: 'file-complete', fileId: f.fileId, rootHash: Array.from(f.rootHash) });
+        f.status = 'complete';
+        f.progress = 100;
+    } catch (err) {
+        console.error('Completing send failed:', err);
+        f.status = 'error';
+        f.error = 'could not finalize';
+    }
+    notifyStatus(f.fileId, 'send');
+    finishActiveFile(f.fileId);
 }
 
 /** Grow/shrink the in-flight window based on how fast ACKs are coming back. */
@@ -405,7 +397,9 @@ export function handleMessage(message) {
         case 'chunk-ack':
             handleChunkAck(message);
             break;
-        case 'file-complete':
+        case 'file-complete': {
+            const rf = receivedFiles.get(message.fileId);
+            if (rf && Array.isArray(message.rootHash)) rf.rootHash = new Uint8Array(message.rootHash);
             assembleAndSaveFile(message.fileId).catch(err => {
                 console.error('Assembly failed:', err);
                 const f = receivedFiles.get(message.fileId);
@@ -416,6 +410,7 @@ export function handleMessage(message) {
                 }
             });
             break;
+        }
         case 'file-cancelled':
             handleCancelled(message.fileId);
             break;
@@ -433,7 +428,7 @@ function handleMetadata(meta) {
         size: meta.size,
         type: meta.fileType || 'application/octet-stream',
         chunks: meta.chunks,
-        rootHash: new Uint8Array(meta.rootHash),
+        rootHash: null,         // arrives with file-complete
         status: 'receiving',
         progress: 0,
         receivedChunks: 0,
@@ -534,7 +529,7 @@ async function assembleAndSaveFile(fileId) {
             leaves.push(f.leafHashes[i]);
         }
         const root = await merkleRoot(leaves);
-        f.verified = bytesEqual(root, f.rootHash);
+        f.verified = !!f.rootHash && bytesEqual(root, f.rootHash);
     } catch (err) {
         f.verified = false;
     }
